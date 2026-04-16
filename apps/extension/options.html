@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>PAMILA Capture Settings</title>
+    <style>
+      body {
+        color: #171717;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 24px;
+        max-width: 520px;
+      }
+
+      label {
+        display: block;
+        font-size: 13px;
+        font-weight: 700;
+        margin: 16px 0 6px;
+      }
+
+      input {
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        box-sizing: border-box;
+        font: inherit;
+        padding: 10px;
+        width: 100%;
+      }
+
+      button {
+        background: #171717;
+        border: 0;
+        border-radius: 6px;
+        color: white;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+        margin-top: 18px;
+        padding: 10px 14px;
+      }
+
+      #status {
+        color: #166534;
+        display: inline-block;
+        font-size: 13px;
+        margin-left: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>PAMILA Capture Settings</h1>
+    <form id="settings-form">
+      <label for="api-base-url">Local API URL</label>
+      <input id="api-base-url" name="api-base-url" type="url" required />
+
+      <label for="local-token">Local API token</label>
+      <input id="local-token" name="local-token" type="password" autocomplete="off" />
+
+      <button type="submit">Save</button>
+      <span id="status" role="status"></span>
+    </form>
+
+    <script type="module" src="dist/options.js"></script>
+  </body>
+</html>

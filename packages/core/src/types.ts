@@ -47,6 +47,8 @@ export type LocationConfidence = "exact" | "high" | "medium" | "low";
 
 export type HardFilterStatus = "included" | "excluded" | "fallback_only" | "needs_cleanup";
 
+export type BedroomFilterMatchStatus = "match" | "no_match" | "unknown_plausible" | "unknown_needs_cleanup";
+
 export interface LocalPorts {
   api: number;
   openTripPlanner: number;
@@ -84,6 +86,12 @@ export interface ListingCore {
   kitchen: YesNoUnknown;
   washer: WasherValue;
   furnished: YesNoUnknown;
+}
+
+export interface ListingEvaluationInput extends ListingCore {
+  dateWindow: ListingDateWindow;
+  location: ListingLocation | null;
+  commute: CommuteSummary | null;
 }
 
 export interface ListingDateWindow {
@@ -131,6 +139,19 @@ export interface ScoreBreakdown {
   scoreExplanation: string;
   cleanupActions: CleanupAction[];
   riskFlags: RiskFlag[];
+}
+
+export interface HardFilterEvaluation {
+  status: HardFilterStatus;
+  reasons: string[];
+  cleanupActions: CleanupAction[];
+  riskFlags: RiskFlag[];
+}
+
+export interface BedroomFilterMatch {
+  status: BedroomFilterMatchStatus;
+  reason: string;
+  normalizedBedroomCount: number | null;
 }
 
 export interface CleanupAction {
