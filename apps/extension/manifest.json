@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "PAMILA Capture",
+  "version": "0.1.0",
+  "description": "Placeholder Chrome helper for saving Airbnb and Leasebreak listings into local PAMILA.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "http://localhost:7410/*",
+    "https://www.airbnb.com/*",
+    "https://www.leasebreak.com/*"
+  ],
+  "background": {
+    "service_worker": "dist/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.airbnb.com/*", "https://www.leasebreak.com/*"],
+      "js": ["dist/contentScript.js"]
+    }
+  ],
+  "action": {
+    "default_title": "Save to PAMILA"
+  }
+}
