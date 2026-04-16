@@ -3,29 +3,47 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { DEFAULT_LOCAL_PORTS } from "@pamila/core";
 
 import { APP_NAME } from "./appConfig";
-import { defaultApiClient } from "./apiClient";
+import { defaultApiClient, PamilaApiClient, type ListingUpdateRequest } from "./apiClient";
 import type {
+  CaptureSuggestion,
+  DashboardSettings,
   DashboardListing,
   DashboardView,
+  ListingBasicsDraft,
   ListingFilters,
-  ManualListingDraft
+  ManualCommuteDraft,
+  ManualListingDraft,
+  ManualLocationDraft
 } from "./dashboardTypes";
 import {
+  applyCaptureSuggestionToListing,
   applyListingFilters,
+  basicsDraftToListingPatch,
+  commuteDraftToSummary,
+  createLocalBackupExport,
+  createLocalCsvExport,
   createManualListing,
+  formatDateTime,
   formatCurrency,
   formatDate,
   getDailyQueue,
+  getMissingFinalistBlockers,
   getShortlist,
-  labelize
+  labelize,
+  listingToBasicsDraft,
+  listingToCommuteDraft,
+  listingToLocationDraft,
+  locationDraftToLocation,
+  markCaptureSuggestion
 } from "./dashboardUtils";
 import { emptyManualListingDraft, initialDashboardSnapshot } from "./mockData";
 
 const navigationItems: Array<{ id: DashboardView; label: string }> = [
   { id: "daily", label: "Daily Queue" },
-  { id: "inbox", label: "Inbox" },
+  { id: "inbox", label: "Inbox + Manual Add" },
   { id: "shortlist", label: "Shortlist" },
   { id: "detail", label: "Listing Detail" },
+  { id: "commute", label: "Map/Commute" },
   { id: "settings", label: "Settings" }
 ];
 
@@ -38,19 +56,27 @@ const defaultFilters: ListingFilters = {
   text: ""
 };
 
-export function App() {
+export interface AppProps {
+  apiClient?: PamilaApiClient;
+}
+
+type ApiConnectionState = "loading" | "connected" | "offline";
+
+export function App({ apiClient = defaultApiClient }: AppProps = {}) {
   const [activeView, setActiveView] = useState<DashboardView>("daily");
   const [listings, setListings] = useState<DashboardListing[]>(initialDashboardSnapshot.listings);
-  const [settings, setSettings] = useState(initialDashboardSnapshot.settings);
+  const [settings, setSettings] = useState<DashboardSettings>(initialDashboardSnapshot.settings);
   const [filters, setFilters] = useState<ListingFilters>(defaultFilters);
   const [selectedListingId, setSelectedListingId] = useState(listings[0]?.id ?? "");
   const [draft, setDraft] = useState<ManualListingDraft>(emptyManualListingDraft);
-  const [apiNotice, setApiNotice] = useState("Using mock data until the local API is available.");
+  const [apiNotice, setApiNotice] = useState("Loading local API snapshot...");
+  const [apiState, setApiState] = useState<ApiConnectionState>("loading");
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
 
   useEffect(() => {
     let isMounted = true;
 
-    defaultApiClient
+    apiClient
       .getDashboardSnapshot()
       .then((snapshot) => {
         if (!isMounted) {
@@ -66,17 +92,19 @@ export function App() {
           maxRent: snapshot.settings.maxMonthlyRent
         }));
         setApiNotice("Connected to local API.");
+        setApiState("connected");
       })
       .catch(() => {
         if (isMounted) {
           setApiNotice("Local API unavailable; showing mock data.");
+          setApiState("offline");
         }
       });
 
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [apiClient]);
 
   const filteredListings = useMemo(() => applyListingFilters(listings, filters), [filters, listings]);
   const dailyQueue = useMemo(() => getDailyQueue(listings), [listings]);
@@ -94,17 +122,128 @@ export function App() {
     [listings, shortlist.length]
   );
 
-  const addManualListing = async () => {
+  const replaceListing = (updatedListing: DashboardListing) => {
+    setListings((current) =>
+      current.map((listing) =>
+        listing.id === updatedListing.id
+          ? {
+              ...listing,
+              ...updatedListing,
+              captureReview: updatedListing.captureReview ?? listing.captureReview ?? null,
+              commute: updatedListing.commute ?? listing.commute,
+              lastCommuteCheckedAt:
+                updatedListing.lastCommuteCheckedAt ?? listing.lastCommuteCheckedAt ?? null,
+              location: updatedListing.location ?? listing.location,
+              locationSourceLabel:
+                updatedListing.locationSourceLabel ?? listing.locationSourceLabel ?? null
+            }
+          : listing
+      )
+    );
+  };
+
+  const applyLocalListingPatch = (listingId: string, patch: ListingUpdateRequest) => {
+    setListings((current) =>
+      current.map((listing) =>
+        listing.id === listingId
+          ? mergeListingPatch(listing, patch)
+          : listing
+      )
+    );
+  };
+
+  const saveListingPatch = async (
+    listingId: string,
+    patch: ListingUpdateRequest,
+    successMessage: string
+  ) => {
+    setPendingAction("Saving listing...");
+
     try {
-      const listing = await defaultApiClient.createListing(draft);
+      const updatedListing = await apiClient.updateListing(listingId, patch);
+      replaceListing(updatedListing);
+      setApiNotice(successMessage);
+      setApiState("connected");
+    } catch {
+      applyLocalListingPatch(listingId, patch);
+      setApiNotice("Local API did not accept that update; saved it in the dashboard session.");
+      setApiState("offline");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const saveSettingsPatch = async (patch: Partial<DashboardSettings>, successMessage: string) => {
+    const nextSettings = {
+      ...settings,
+      ...patch
+    };
+
+    setSettings(nextSettings);
+    setFilters((current) => ({
+      ...current,
+      includeFallback: nextSettings.panicModeEnabled,
+      maxRent: nextSettings.maxMonthlyRent
+    }));
+    setPendingAction("Saving settings...");
+
+    try {
+      const savedSettings = await apiClient.updateSettings(nextSettings);
+      setSettings(savedSettings);
+      setFilters((current) => ({
+        ...current,
+        includeFallback: savedSettings.panicModeEnabled,
+        maxRent: savedSettings.maxMonthlyRent
+      }));
+      setApiNotice(successMessage);
+      setApiState("connected");
+    } catch {
+      setApiNotice("Local API unavailable; settings changed locally for this session.");
+      setApiState("offline");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const addManualListing = async () => {
+    setPendingAction("Adding listing...");
+
+    try {
+      let listing = await apiClient.createListing(draft);
+
+      if (draft.neighborhood.trim()) {
+        const locationDraft = {
+          address: "",
+          confidenceLabel: "neighborhood" as const,
+          crossStreets: "",
+          neighborhood: draft.neighborhood,
+          sourceLabel: "captured_text" as const
+        };
+        const location = locationDraftToLocation(locationDraft);
+
+        try {
+          listing = await apiClient.updateListingLocation(listing.id, location, "captured_text");
+        } catch {
+          listing = {
+            ...listing,
+            location,
+            locationSourceLabel: "captured_text"
+          };
+        }
+      }
+
       setListings((current) => [listing, ...current]);
       setSelectedListingId(listing.id);
       setActiveView("detail");
       setDraft(emptyManualListingDraft);
       setApiNotice("Saved listing through local API.");
+      setApiState("connected");
       return;
     } catch {
       setApiNotice("Could not reach local API; added listing locally only.");
+      setApiState("offline");
+    } finally {
+      setPendingAction(null);
     }
 
     const listing = createManualListing(draft, listings.length);
@@ -115,17 +254,142 @@ export function App() {
   };
 
   const updateStatus = (listingId: string, status: DashboardListing["status"]) => {
+    void saveListingPatch(listingId, { status }, `Marked listing ${labelize(status).toLowerCase()}.`);
+  };
+
+  const saveLocation = async (
+    listingId: string,
+    locationDraft: ManualLocationDraft
+  ) => {
+    const location = locationDraftToLocation(locationDraft);
+    setPendingAction("Saving location...");
+
+    try {
+      const updatedListing = await apiClient.updateListingLocation(
+        listingId,
+        location,
+        locationDraft.sourceLabel
+      );
+      replaceListing(updatedListing);
+      setApiNotice("Saved listing location through local API.");
+      setApiState("connected");
+    } catch {
+      setListings((current) =>
+        current.map((listing) =>
+          listing.id === listingId
+            ? {
+                ...listing,
+                location,
+                locationSourceLabel: locationDraft.sourceLabel,
+                updatedAt: new Date().toISOString()
+              }
+            : listing
+        )
+      );
+      setApiNotice("Location saved locally until the API location route is connected.");
+      setApiState("offline");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const saveCommute = async (listingId: string, commuteDraft: ManualCommuteDraft) => {
+    const commute = commuteDraftToSummary(commuteDraft);
+    const checkedAt = commuteDraft.lastCheckedAt || new Date().toISOString();
+    setPendingAction("Saving commute...");
+
+    try {
+      const updatedListing = await apiClient.updateListingCommute(listingId, commute, checkedAt);
+      replaceListing(updatedListing);
+      setApiNotice("Saved manual commute through local API.");
+      setApiState("connected");
+    } catch {
+      setListings((current) =>
+        current.map((listing) =>
+          listing.id === listingId
+            ? {
+                ...listing,
+                commute,
+                lastCommuteCheckedAt: checkedAt,
+                updatedAt: new Date().toISOString()
+              }
+            : listing
+        )
+      );
+      setApiNotice("Commute saved locally until the API commute route is connected.");
+      setApiState("offline");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const applyCaptureSuggestion = async (
+    listingId: string,
+    suggestion: CaptureSuggestion
+  ) => {
+    const listing = listings.find((candidate) => candidate.id === listingId);
+    if (!listing) {
+      return;
+    }
+
+    const locallyApplied = markCaptureSuggestion(
+      applyCaptureSuggestionToListing(listing, suggestion),
+      suggestion.id,
+      "applied"
+    );
+    replaceListing(locallyApplied);
+
+    if (suggestion.field === "location") {
+      await saveLocation(listingId, suggestion.value as ManualLocationDraft);
+      return;
+    }
+
+    await saveListingPatch(
+      listingId,
+      suggestionToListingPatch(suggestion),
+      "Applied capture suggestion through local API."
+    );
+    replaceListing(markCaptureSuggestion(locallyApplied, suggestion.id, "applied"));
+  };
+
+  const rejectCaptureSuggestion = (listingId: string, suggestionId: string) => {
     setListings((current) =>
       current.map((listing) =>
-        listing.id === listingId
-          ? {
-              ...listing,
-              status,
-              updatedAt: new Date().toISOString()
-            }
-          : listing
+        listing.id === listingId ? markCaptureSuggestion(listing, suggestionId, "rejected") : listing
       )
     );
+    setApiNotice("Rejected capture suggestion locally.");
+  };
+
+  const exportData = async (kind: "csv" | "json") => {
+    setPendingAction(kind === "csv" ? "Exporting CSV..." : "Exporting backup...");
+
+    try {
+      if (kind === "csv") {
+        const csv = await apiClient.exportListingsCsv();
+        downloadTextFile("pamila-listings.csv", csv.body, csv.contentType);
+      } else {
+        const backup = await apiClient.exportBackupJson();
+        downloadTextFile("pamila-backup.json", JSON.stringify(backup, null, 2), "application/json");
+      }
+
+      setApiNotice("Export downloaded from local API.");
+      setApiState("connected");
+    } catch {
+      const localBody =
+        kind === "csv"
+          ? createLocalCsvExport(listings)
+          : createLocalBackupExport({ listings, settings });
+      downloadTextFile(
+        kind === "csv" ? "pamila-listings-local.csv" : "pamila-backup-local.json",
+        localBody,
+        kind === "csv" ? "text/csv" : "application/json"
+      );
+      setApiNotice("Local API unavailable; downloaded a dashboard-session export.");
+      setApiState("offline");
+    } finally {
+      setPendingAction(null);
+    }
   };
 
   return (
@@ -168,21 +432,32 @@ export function App() {
           <div>
             <p className="eyebrow">Apartment triage cockpit</p>
             <h2>{viewTitle(activeView)}</h2>
-            <p className="api-notice">{apiNotice}</p>
+            <p className={`api-notice api-${apiState}`}>
+              {pendingAction ? `${pendingAction} ` : ""}
+              {apiNotice}
+            </p>
           </div>
           <div className="header-actions" aria-label="Dashboard actions">
             <button
               className={filters.includeFallback ? "toggle toggle-on" : "toggle"}
               onClick={() =>
-                setFilters((current) => ({
-                  ...current,
-                  includeFallback: !current.includeFallback
-                }))
+                void saveSettingsPatch(
+                  { panicModeEnabled: !settings.panicModeEnabled },
+                  `Panic Mode ${settings.panicModeEnabled ? "disabled" : "enabled"}.`
+                )
               }
               type="button"
             >
               <span aria-hidden="true">!</span>
-              Panic Mode {filters.includeFallback ? "On" : "Off"}
+              Panic Mode {settings.panicModeEnabled ? "On" : "Off"}
+            </button>
+            <button className="text-button" onClick={() => void exportData("csv")} type="button">
+              <span aria-hidden="true">v</span>
+              Export CSV
+            </button>
+            <button className="text-button" onClick={() => void exportData("json")} type="button">
+              <span aria-hidden="true">J</span>
+              Backup JSON
             </button>
             <a className="text-button" href={`http://localhost:${DEFAULT_LOCAL_PORTS.api}/health`}>
               API health
@@ -214,8 +489,10 @@ export function App() {
             filters={filters}
             listings={filteredListings}
             onAddListing={addManualListing}
+            onApplySuggestion={applyCaptureSuggestion}
             onDraftChange={setDraft}
             onFiltersChange={setFilters}
+            onRejectSuggestion={rejectCaptureSuggestion}
             onSelect={(listing) => {
               setSelectedListingId(listing.id);
               setActiveView("detail");
@@ -239,13 +516,46 @@ export function App() {
         ) : null}
 
         {activeView === "detail" && selectedListing ? (
-          <ListingDetailView listing={selectedListing} onStatusChange={updateStatus} />
+          <ListingDetailView
+            listing={selectedListing}
+            onSaveBasics={(listingId, basicsDraft) => {
+              const patch = basicsDraftToListingPatch(basicsDraft);
+              const current = listings.find((candidate) => candidate.id === listingId);
+              void saveListingPatch(
+                listingId,
+                {
+                  ...patch,
+                  dateWindow: {
+                    ...(current?.dateWindow ?? {}),
+                    ...patch.dateWindow
+                  }
+                },
+                "Saved listing details through local API."
+              );
+            }}
+            onSaveCommute={saveCommute}
+            onSaveLocation={saveLocation}
+            onStatusChange={updateStatus}
+          />
+        ) : null}
+
+        {activeView === "commute" ? (
+          <CommutePlaceholderView
+            listings={filteredListings}
+            onSelect={(listing) => {
+              setSelectedListingId(listing.id);
+              setActiveView("detail");
+            }}
+            settings={settings}
+          />
         ) : null}
 
         {activeView === "settings" ? (
           <SettingsView
+            onExport={exportData}
             filters={filters}
             onFiltersChange={setFilters}
+            onSaveSettings={saveSettingsPatch}
             settings={settings}
             snapshotCount={filteredListings.length}
           />
@@ -277,14 +587,18 @@ function DailyQueueView({
         </p>
       </div>
       <div className="listing-grid">
-        {listings.map((listing) => (
-          <ListingCard
-            key={listing.id}
-            listing={listing}
-            onSelect={onSelect}
-            onStatusChange={onStatusChange}
-          />
-        ))}
+        {listings.length > 0 ? (
+          listings.map((listing) => (
+            <ListingCard
+              key={listing.id}
+              listing={listing}
+              onSelect={onSelect}
+              onStatusChange={onStatusChange}
+            />
+          ))
+        ) : (
+          <p className="empty-state">No eligible daily queue items yet.</p>
+        )}
       </div>
     </section>
   );
@@ -295,17 +609,21 @@ function InboxView({
   filters,
   listings,
   onAddListing,
+  onApplySuggestion,
   onDraftChange,
   onFiltersChange,
+  onRejectSuggestion,
   onSelect,
   onStatusChange
 }: {
   draft: ManualListingDraft;
   filters: ListingFilters;
   listings: DashboardListing[];
-  onAddListing: () => void;
+  onAddListing: () => void | Promise<void>;
+  onApplySuggestion: (listingId: string, suggestion: CaptureSuggestion) => void | Promise<void>;
   onDraftChange: (draft: ManualListingDraft) => void;
   onFiltersChange: (filters: ListingFilters) => void;
+  onRejectSuggestion: (listingId: string, suggestionId: string) => void;
   onSelect: (listing: DashboardListing) => void;
   onStatusChange: (listingId: string, status: DashboardListing["status"]) => void;
 }) {
@@ -317,6 +635,12 @@ function InboxView({
     <section className="two-column-view">
       <div className="view-stack">
         <FilterBar filters={filters} onFiltersChange={onFiltersChange} />
+        <CaptureCleanupQueue
+          listings={inboxListings}
+          onApplySuggestion={onApplySuggestion}
+          onRejectSuggestion={onRejectSuggestion}
+          onSelect={onSelect}
+        />
         <ListingListView
           description="New and partially cleaned listings from manual entry, paste import, or extension capture."
           emptyLabel="No inbox listings match the current filters."
@@ -327,6 +651,138 @@ function InboxView({
         />
       </div>
       <ManualListingForm draft={draft} onAddListing={onAddListing} onDraftChange={onDraftChange} />
+    </section>
+  );
+}
+
+function CaptureCleanupQueue({
+  listings,
+  onApplySuggestion,
+  onRejectSuggestion,
+  onSelect
+}: {
+  listings: DashboardListing[];
+  onApplySuggestion: (listingId: string, suggestion: CaptureSuggestion) => void | Promise<void>;
+  onRejectSuggestion: (listingId: string, suggestionId: string) => void;
+  onSelect: (listing: DashboardListing) => void;
+}) {
+  const cleanupListings = listings.filter(
+    (listing) =>
+      listing.captureReview ||
+      getMissingFinalistBlockers(listing).length > 0 ||
+      listing.score.cleanupActions.length > 0
+  );
+
+  if (cleanupListings.length === 0) {
+    return (
+      <section className="cleanup-panel">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Capture cleanup</p>
+            <h3>Nothing to clean right now</h3>
+          </div>
+        </div>
+        <p className="empty-state">Captured listings will show suggested fields and blockers here.</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="cleanup-panel">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Capture cleanup</p>
+          <h3>Resolve captured uncertainty</h3>
+        </div>
+        <p className="section-copy">
+          Apply clear suggestions, reject noisy ones, and fill finalist blockers before comparing.
+        </p>
+      </div>
+
+      <div className="cleanup-list">
+        {cleanupListings.slice(0, 4).map((listing) => (
+          <article className="cleanup-item" key={listing.id}>
+            <div className="cleanup-item-header">
+              <div>
+                <p className="source-line">
+                  <span>{labelize(listing.source)}</span>
+                  <span>{labelize(listing.status)}</span>
+                </p>
+                <h4>{listing.captureReview?.capturedTitle ?? listing.title}</h4>
+              </div>
+              <button className="icon-button" onClick={() => onSelect(listing)} type="button">
+                <span aria-hidden="true">#</span>
+                Detail
+              </button>
+            </div>
+
+            <dl className="capture-facts">
+              <Fact label="Raw source" value={labelize(listing.captureReview?.source ?? listing.source)} />
+              <Fact label="Raw title" value={listing.captureReview?.capturedTitle ?? listing.title} />
+            </dl>
+
+            <p className="capture-excerpt">
+              {listing.captureReview?.pageExcerpt ?? "No raw capture excerpt stored yet."}
+            </p>
+
+            {listing.captureReview && Object.keys(listing.captureReview.visibleFields).length > 0 ? (
+              <div className="visible-field-grid" aria-label="Captured visible fields">
+                {Object.entries(listing.captureReview.visibleFields).slice(0, 6).map(([key, value]) => (
+                  <Fact key={key} label={labelize(key)} value={value} />
+                ))}
+              </div>
+            ) : null}
+
+            <BlockerList blockers={getMissingFinalistBlockers(listing)} />
+
+            {listing.captureReview?.suggestions.length ? (
+              <div className="suggestion-list" aria-label="Capture suggestions">
+                {listing.captureReview.suggestions.map((suggestion) => (
+                  <div
+                    className={
+                      suggestion.rejected
+                        ? "suggestion suggestion-muted"
+                        : suggestion.applied
+                          ? "suggestion suggestion-applied"
+                          : "suggestion"
+                    }
+                    key={suggestion.id}
+                  >
+                    <div>
+                      <strong>{suggestion.label}</strong>
+                      <span>
+                        {labelize(suggestion.source)} · {labelize(suggestion.confidence)}
+                      </span>
+                    </div>
+                    <div className="suggestion-actions">
+                      <button
+                        className="icon-button"
+                        disabled={suggestion.applied || suggestion.rejected}
+                        onClick={() => void onApplySuggestion(listing.id, suggestion)}
+                        type="button"
+                      >
+                        <span aria-hidden="true">+</span>
+                        Apply
+                      </button>
+                      <button
+                        className="icon-button"
+                        disabled={suggestion.applied || suggestion.rejected}
+                        onClick={() => onRejectSuggestion(listing.id, suggestion.id)}
+                        type="button"
+                      >
+                        <span aria-hidden="true">x</span>
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty-state">No structured suggestions yet; use the detail form to clean manually.</p>
+            )}
+          </article>
+        ))}
+      </div>
     </section>
   );
 }
@@ -440,6 +896,24 @@ function ListingCard({
           <span aria-hidden="true">-&gt;</span>
           Details
         </button>
+        <select
+          aria-label={`Status for ${listing.title}`}
+          className="compact-select"
+          onChange={(event) =>
+            onStatusChange(listing.id, event.target.value as DashboardListing["status"])
+          }
+          value={listing.status}
+        >
+          <option value="new">New</option>
+          <option value="needs_cleanup">Needs cleanup</option>
+          <option value="ready_to_review">Ready</option>
+          <option value="shortlisted">Shortlisted</option>
+          <option value="contacted">Contacted</option>
+          <option value="waiting_for_response">Waiting</option>
+          <option value="rejected_by_user">Rejected</option>
+          <option value="finalist">Finalist</option>
+          <option value="chosen">Chosen</option>
+        </select>
         <button
           className="icon-button"
           onClick={() => onStatusChange(listing.id, "shortlisted")}
@@ -455,11 +929,27 @@ function ListingCard({
 
 function ListingDetailView({
   listing,
+  onSaveBasics,
+  onSaveCommute,
+  onSaveLocation,
   onStatusChange
 }: {
   listing: DashboardListing;
+  onSaveBasics: (listingId: string, draft: ListingBasicsDraft) => void;
+  onSaveCommute: (listingId: string, draft: ManualCommuteDraft) => void | Promise<void>;
+  onSaveLocation: (listingId: string, draft: ManualLocationDraft) => void | Promise<void>;
   onStatusChange: (listingId: string, status: DashboardListing["status"]) => void;
 }) {
+  const [basicsDraft, setBasicsDraft] = useState(() => listingToBasicsDraft(listing));
+  const [commuteDraft, setCommuteDraft] = useState(() => listingToCommuteDraft(listing));
+  const [locationDraft, setLocationDraft] = useState(() => listingToLocationDraft(listing));
+
+  useEffect(() => {
+    setBasicsDraft(listingToBasicsDraft(listing));
+    setCommuteDraft(listingToCommuteDraft(listing));
+    setLocationDraft(listingToLocationDraft(listing));
+  }, [listing]);
+
   return (
     <section className="detail-layout">
       <article className="detail-main">
@@ -474,6 +964,8 @@ function ListingDetailView({
         </div>
 
         <p className="score-explanation">{listing.score.scoreExplanation}</p>
+
+        <BlockerList blockers={getMissingFinalistBlockers(listing)} />
 
         <div className="score-bars" aria-label="Score breakdown">
           <ScoreBar label="Commute" max={35} value={listing.score.commuteScore} />
@@ -506,6 +998,26 @@ function ListingDetailView({
             Reject
           </button>
         </div>
+
+        <BasicsEditor
+          draft={basicsDraft}
+          onDraftChange={setBasicsDraft}
+          onSave={() => onSaveBasics(listing.id, basicsDraft)}
+        />
+
+        <LocationEditor
+          draft={locationDraft}
+          listing={listing}
+          onDraftChange={setLocationDraft}
+          onSave={() => void onSaveLocation(listing.id, locationDraft)}
+        />
+
+        <CommuteEditor
+          draft={commuteDraft}
+          listing={listing}
+          onDraftChange={setCommuteDraft}
+          onSave={() => void onSaveCommute(listing.id, commuteDraft)}
+        />
       </article>
 
       <aside className="detail-side" aria-label="Listing facts">
@@ -525,11 +1037,28 @@ function ListingDetailView({
         />
         <Fact label="Location" value={listing.location?.label ?? "Needs location"} />
         <Fact
+          label="Location confidence"
+          value={listing.location ? labelize(listingToLocationDraft(listing).confidenceLabel) : "Unknown"}
+        />
+        <Fact
+          label="Location source"
+          value={labelize(listing.locationSourceLabel ?? listingToLocationDraft(listing).sourceLabel)}
+        />
+        <Fact
           label="Commute"
           value={
             listing.commute?.routeSummary ??
             (listing.commute?.totalMinutes ? `${listing.commute.totalMinutes} min` : "Unknown")
           }
+        />
+        <Fact label="Walk" value={listing.commute?.walkMinutes ? `${listing.commute.walkMinutes} min` : "Unknown"} />
+        <Fact
+          label="Lines"
+          value={listing.commute?.lineNames.length ? listing.commute.lineNames.join(", ") : "Unknown"}
+        />
+        <Fact
+          label="Last checked"
+          value={formatDateTime(listing.lastCommuteCheckedAt)}
         />
 
         <h3>Cleanup actions</h3>
@@ -545,6 +1074,303 @@ function ListingDetailView({
         <p className="notes">{listing.userNotes || "No notes yet."}</p>
       </aside>
     </section>
+  );
+}
+
+function BasicsEditor({
+  draft,
+  onDraftChange,
+  onSave
+}: {
+  draft: ListingBasicsDraft;
+  onDraftChange: (draft: ListingBasicsDraft) => void;
+  onSave: () => void;
+}) {
+  return (
+    <section className="editor-panel" aria-label="Edit listing basics">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Listing basics</p>
+          <h3>Edit source fields</h3>
+        </div>
+        <button className="primary-button compact-action" onClick={onSave} type="button">
+          <span aria-hidden="true">s</span>
+          Save basics
+        </button>
+      </div>
+      <div className="form-row">
+        <Field label="Title">
+          <input
+            onChange={(event) => onDraftChange({ ...draft, title: event.target.value })}
+            value={draft.title}
+          />
+        </Field>
+        <Field label="Source URL">
+          <input
+            onChange={(event) => onDraftChange({ ...draft, sourceUrl: event.target.value })}
+            value={draft.sourceUrl}
+          />
+        </Field>
+      </div>
+      <div className="form-row">
+        <Field label="Rent">
+          <input
+            inputMode="numeric"
+            onChange={(event) => onDraftChange({ ...draft, monthlyRent: event.target.value })}
+            value={draft.monthlyRent}
+          />
+        </Field>
+        <Field label="Stay">
+          <select
+            onChange={(event) =>
+              onDraftChange({
+                ...draft,
+                stayType: event.target.value as ListingBasicsDraft["stayType"]
+              })
+            }
+            value={draft.stayType}
+          >
+            <option value="entire_apartment">Entire apartment</option>
+            <option value="private_room">Private room</option>
+            <option value="shared_room">Shared room</option>
+            <option value="unknown">Unknown</option>
+          </select>
+        </Field>
+      </div>
+      <div className="form-row">
+        <Field label="Bedroom label">
+          <input
+            onChange={(event) => onDraftChange({ ...draft, bedroomLabel: event.target.value })}
+            value={draft.bedroomLabel}
+          />
+        </Field>
+        <Field label="Bedroom count">
+          <input
+            inputMode="decimal"
+            onChange={(event) => onDraftChange({ ...draft, bedroomCount: event.target.value })}
+            value={draft.bedroomCount}
+          />
+        </Field>
+      </div>
+      <Field label="Availability">
+        <input
+          onChange={(event) => onDraftChange({ ...draft, availabilitySummary: event.target.value })}
+          value={draft.availabilitySummary}
+        />
+      </Field>
+      <Field label="Notes">
+        <textarea
+          onChange={(event) => onDraftChange({ ...draft, userNotes: event.target.value })}
+          rows={4}
+          value={draft.userNotes}
+        />
+      </Field>
+    </section>
+  );
+}
+
+function LocationEditor({
+  draft,
+  listing,
+  onDraftChange,
+  onSave
+}: {
+  draft: ManualLocationDraft;
+  listing: DashboardListing;
+  onDraftChange: (draft: ManualLocationDraft) => void;
+  onSave: () => void;
+}) {
+  return (
+    <section className="editor-panel" aria-label="Manual location">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Manual location</p>
+          <h3>Confirm place confidence</h3>
+        </div>
+        <button className="primary-button compact-action" onClick={onSave} type="button">
+          <span aria-hidden="true">s</span>
+          Save location
+        </button>
+      </div>
+      <div className="form-row">
+        <Field label="Address">
+          <input
+            onChange={(event) => onDraftChange({ ...draft, address: event.target.value })}
+            placeholder="Exact address if known"
+            value={draft.address}
+          />
+        </Field>
+        <Field label="Cross streets">
+          <input
+            onChange={(event) => onDraftChange({ ...draft, crossStreets: event.target.value })}
+            placeholder="W 23rd St and 6th Ave"
+            value={draft.crossStreets}
+          />
+        </Field>
+      </div>
+      <Field label="Neighborhood">
+        <input
+          onChange={(event) => onDraftChange({ ...draft, neighborhood: event.target.value })}
+          placeholder="Chelsea, NoMad, LIC"
+          value={draft.neighborhood}
+        />
+      </Field>
+      <div className="form-row">
+        <Field label="Confidence">
+          <select
+            onChange={(event) =>
+              onDraftChange({
+                ...draft,
+                confidenceLabel: event.target.value as ManualLocationDraft["confidenceLabel"]
+              })
+            }
+            value={draft.confidenceLabel}
+          >
+            <option value="exact">Exact</option>
+            <option value="cross_street">Cross-street</option>
+            <option value="neighborhood">Neighborhood</option>
+            <option value="approximate">Approximate</option>
+            <option value="unknown">Unknown</option>
+          </select>
+        </Field>
+        <Field label="Source">
+          <select
+            onChange={(event) =>
+              onDraftChange({
+                ...draft,
+                sourceLabel: event.target.value as ManualLocationDraft["sourceLabel"]
+              })
+            }
+            value={draft.sourceLabel}
+          >
+            <option value="user_confirmed">User-confirmed</option>
+            <option value="airbnb_approximate">Airbnb approximate</option>
+            <option value="leasebreak">Leasebreak</option>
+            <option value="captured_text">Captured text</option>
+          </select>
+        </Field>
+      </div>
+      <p className="subtle-copy">
+        Current: {listing.location?.label ?? "Needs location"} ·{" "}
+        {labelize(listing.locationSourceLabel ?? draft.sourceLabel)}
+      </p>
+    </section>
+  );
+}
+
+function CommuteEditor({
+  draft,
+  listing,
+  onDraftChange,
+  onSave
+}: {
+  draft: ManualCommuteDraft;
+  listing: DashboardListing;
+  onDraftChange: (draft: ManualCommuteDraft) => void;
+  onSave: () => void;
+}) {
+  return (
+    <section className="editor-panel" aria-label="Manual commute">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Manual commute</p>
+          <h3>Record route quality</h3>
+        </div>
+        <button
+          className="primary-button compact-action"
+          onClick={() =>
+            onDraftChange({
+              ...draft,
+              lastCheckedAt: new Date().toISOString()
+            })
+          }
+          type="button"
+        >
+          <span aria-hidden="true">t</span>
+          Stamp time
+        </button>
+      </div>
+      <div className="form-row">
+        <Field label="Minutes">
+          <input
+            inputMode="numeric"
+            onChange={(event) => onDraftChange({ ...draft, totalMinutes: event.target.value })}
+            placeholder="20"
+            value={draft.totalMinutes}
+          />
+        </Field>
+        <Field label="Transfers">
+          <input
+            inputMode="numeric"
+            onChange={(event) => onDraftChange({ ...draft, transferCount: event.target.value })}
+            placeholder="0"
+            value={draft.transferCount}
+          />
+        </Field>
+      </div>
+      <div className="form-row">
+        <Field label="Walk minutes">
+          <input
+            inputMode="numeric"
+            onChange={(event) => onDraftChange({ ...draft, walkMinutes: event.target.value })}
+            placeholder="6"
+            value={draft.walkMinutes}
+          />
+        </Field>
+        <Field label="Lines">
+          <input
+            onChange={(event) => onDraftChange({ ...draft, lineNames: event.target.value })}
+            placeholder="N, R, W"
+            value={draft.lineNames}
+          />
+        </Field>
+      </div>
+      <Field label="Route notes">
+        <input
+          onChange={(event) => onDraftChange({ ...draft, routeSummary: event.target.value })}
+          placeholder="N/R/W to 23 St, short walk"
+          value={draft.routeSummary}
+        />
+      </Field>
+      <label className="checkbox-row">
+        <input
+          checked={draft.hasBusHeavyRoute}
+          onChange={(event) =>
+            onDraftChange({ ...draft, hasBusHeavyRoute: event.target.checked })
+          }
+          type="checkbox"
+        />
+        Bus-heavy route
+      </label>
+      <div className="detail-actions">
+        <button className="primary-button compact-action" onClick={onSave} type="button">
+          <span aria-hidden="true">s</span>
+          Save commute
+        </button>
+        <span className="subtle-copy">
+          Last checked: {formatDateTime(draft.lastCheckedAt || listing.lastCommuteCheckedAt)}
+        </span>
+      </div>
+    </section>
+  );
+}
+
+function BlockerList({ blockers }: { blockers: string[] }) {
+  if (blockers.length === 0) {
+    return (
+      <div className="blocker-list blocker-list-clear">
+        <span>Finalist fields present</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="blocker-list" aria-label="Missing finalist blockers">
+      <span>Missing finalist blockers:</span>
+      {blockers.map((blocker) => (
+        <strong key={blocker}>{blocker}</strong>
+      ))}
+    </div>
   );
 }
 
@@ -718,56 +1544,297 @@ function FilterBar({
   );
 }
 
+function CommutePlaceholderView({
+  listings,
+  onSelect,
+  settings
+}: {
+  listings: DashboardListing[];
+  onSelect: (listing: DashboardListing) => void;
+  settings: DashboardSettings;
+}) {
+  const withCommute = listings.filter((listing) => listing.location || listing.commute);
+
+  return (
+    <section className="view-stack">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Map/Commute placeholder</p>
+          <h3>Route board before OTP map integration</h3>
+        </div>
+        <p className="section-copy">
+          Pins and polylines will land after OTP routing is wired. For now this view keeps location,
+          route quality, and manual commute checks in one scannable place.
+        </p>
+      </div>
+
+      <article className="map-placeholder" aria-label="Future map area">
+        <div className="map-ramp-marker">
+          <strong>Ramp</strong>
+          <span>{settings.officeAddress}</span>
+        </div>
+        <div className="map-placeholder-grid">
+          <Metric label="Ideal" value={`${settings.idealCommuteMinutes}m`} />
+          <Metric label="Acceptable" value={`${settings.acceptableCommuteMinutes}m`} />
+          <Metric label="Long walk" value={`${settings.longWalkMinutes}m`} />
+        </div>
+      </article>
+
+      {withCommute.length > 0 ? (
+        <div className="commute-table" aria-label="Commute summaries">
+          {withCommute.map((listing) => (
+            <button className="commute-row" key={listing.id} onClick={() => onSelect(listing)} type="button">
+              <span>
+                <strong>{listing.title}</strong>
+                <small>{listing.location?.label ?? "Needs location"}</small>
+              </span>
+              <span>{listing.commute?.totalMinutes ? `${listing.commute.totalMinutes} min` : "No time"}</span>
+              <span>{listing.commute?.transferCount ?? "?"} transfers</span>
+              <span>{listing.commute?.walkMinutes ? `${listing.commute.walkMinutes} min walk` : "walk ?"}</span>
+              <span>{listing.commute?.hasBusHeavyRoute ? "Bus-heavy" : "Rail/walk"}</span>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <p className="empty-state">Add a location or manual commute to see listings here.</p>
+      )}
+    </section>
+  );
+}
+
 function SettingsView({
   filters,
+  onExport,
   onFiltersChange,
+  onSaveSettings,
   settings,
   snapshotCount
 }: {
   filters: ListingFilters;
+  onExport: (kind: "csv" | "json") => void | Promise<void>;
   onFiltersChange: (filters: ListingFilters) => void;
-  settings: typeof initialDashboardSnapshot.settings;
+  onSaveSettings: (patch: Partial<DashboardSettings>, successMessage: string) => void | Promise<void>;
+  settings: DashboardSettings;
   snapshotCount: number;
 }) {
+  const [settingsDraft, setSettingsDraft] = useState({
+    acceptableCommuteMinutes: String(settings.acceptableCommuteMinutes),
+    aiOnCaptureEnabled: settings.aiOnCaptureEnabled ?? false,
+    defaultBedroomFilter: settings.defaultBedroomFilter,
+    idealCommuteMinutes: String(settings.idealCommuteMinutes),
+    longWalkMinutes: String(settings.longWalkMinutes),
+    maxMonthlyRent: String(settings.maxMonthlyRent),
+    officeAddress: settings.officeAddress,
+    officeName: settings.officeName,
+    panicModeEnabled: settings.panicModeEnabled,
+    targetEnd: settings.targetEnd,
+    targetStartPrimary: settings.targetStartPrimary,
+    targetStartSecondary: settings.targetStartSecondary
+  });
+
+  useEffect(() => {
+    setSettingsDraft({
+      acceptableCommuteMinutes: String(settings.acceptableCommuteMinutes),
+      aiOnCaptureEnabled: settings.aiOnCaptureEnabled ?? false,
+      defaultBedroomFilter: settings.defaultBedroomFilter,
+      idealCommuteMinutes: String(settings.idealCommuteMinutes),
+      longWalkMinutes: String(settings.longWalkMinutes),
+      maxMonthlyRent: String(settings.maxMonthlyRent),
+      officeAddress: settings.officeAddress,
+      officeName: settings.officeName,
+      panicModeEnabled: settings.panicModeEnabled,
+      targetEnd: settings.targetEnd,
+      targetStartPrimary: settings.targetStartPrimary,
+      targetStartSecondary: settings.targetStartSecondary
+    });
+  }, [settings]);
+
   return (
     <section className="settings-grid">
       <article className="settings-panel">
         <p className="eyebrow">Default search profile</p>
-        <h3>{settings.officeName}</h3>
-        <p className="section-copy">{settings.officeAddress}</p>
-        <dl className="settings-list">
-          <Fact label="Primary start" value={formatDate(settings.targetStartPrimary)} />
-          <Fact label="Secondary start" value={formatDate(settings.targetStartSecondary)} />
-          <Fact label="End date" value={formatDate(settings.targetEnd)} />
-          <Fact label="Budget cap" value={formatCurrency(settings.maxMonthlyRent)} />
-          <Fact label="Bedrooms" value={labelize(settings.defaultBedroomFilter)} />
-          <Fact label="Normal stay" value={labelize(settings.normalStayType)} />
-          <Fact label="Fallback stay" value={labelize(settings.fallbackStayType)} />
-          <Fact label="Commute target" value={`${settings.idealCommuteMinutes}-${settings.acceptableCommuteMinutes} min`} />
-          <Fact label="Walk penalty" value={`${settings.longWalkMinutes}+ min`} />
-        </dl>
+        <h3>Search defaults</h3>
+        <div className="form-row">
+          <Field label="Office name">
+            <input
+              onChange={(event) =>
+                setSettingsDraft({ ...settingsDraft, officeName: event.target.value })
+              }
+              value={settingsDraft.officeName}
+            />
+          </Field>
+          <Field label="Budget cap">
+            <input
+              inputMode="numeric"
+              onChange={(event) =>
+                setSettingsDraft({ ...settingsDraft, maxMonthlyRent: event.target.value })
+              }
+              value={settingsDraft.maxMonthlyRent}
+            />
+          </Field>
+        </div>
+        <Field label="Office address">
+          <input
+            onChange={(event) =>
+              setSettingsDraft({ ...settingsDraft, officeAddress: event.target.value })
+            }
+            value={settingsDraft.officeAddress}
+          />
+        </Field>
+        <div className="form-row">
+          <Field label="Primary start">
+            <input
+              onChange={(event) =>
+                setSettingsDraft({ ...settingsDraft, targetStartPrimary: event.target.value })
+              }
+              type="date"
+              value={settingsDraft.targetStartPrimary}
+            />
+          </Field>
+          <Field label="Secondary start">
+            <input
+              onChange={(event) =>
+                setSettingsDraft({ ...settingsDraft, targetStartSecondary: event.target.value })
+              }
+              type="date"
+              value={settingsDraft.targetStartSecondary}
+            />
+          </Field>
+        </div>
+        <div className="form-row">
+          <Field label="End date">
+            <input
+              onChange={(event) =>
+                setSettingsDraft({ ...settingsDraft, targetEnd: event.target.value })
+              }
+              type="date"
+              value={settingsDraft.targetEnd}
+            />
+          </Field>
+          <Field label="Bedroom default">
+            <select
+              onChange={(event) =>
+                setSettingsDraft({
+                  ...settingsDraft,
+                  defaultBedroomFilter: event.target.value as DashboardSettings["defaultBedroomFilter"]
+                })
+              }
+              value={settingsDraft.defaultBedroomFilter}
+            >
+              <option value="studio_or_1br">Studio or 1BR</option>
+              <option value="studio_only">Studio only</option>
+              <option value="studio_plus">Studio+</option>
+              <option value="one_bedroom_only">1BR only</option>
+              <option value="exactly_two_bedrooms">Only 2BR</option>
+              <option value="any_entire_place">Any entire place</option>
+            </select>
+          </Field>
+        </div>
+        <div className="form-row">
+          <Field label="Ideal commute">
+            <input
+              inputMode="numeric"
+              onChange={(event) =>
+                setSettingsDraft({ ...settingsDraft, idealCommuteMinutes: event.target.value })
+              }
+              value={settingsDraft.idealCommuteMinutes}
+            />
+          </Field>
+          <Field label="Acceptable commute">
+            <input
+              inputMode="numeric"
+              onChange={(event) =>
+                setSettingsDraft({
+                  ...settingsDraft,
+                  acceptableCommuteMinutes: event.target.value
+                })
+              }
+              value={settingsDraft.acceptableCommuteMinutes}
+            />
+          </Field>
+        </div>
+        <Field label="Long walk threshold">
+          <input
+            inputMode="numeric"
+            onChange={(event) =>
+              setSettingsDraft({ ...settingsDraft, longWalkMinutes: event.target.value })
+            }
+            value={settingsDraft.longWalkMinutes}
+          />
+        </Field>
+        <label className="checkbox-row">
+          <input
+            checked={settingsDraft.panicModeEnabled}
+            onChange={(event) =>
+              setSettingsDraft({ ...settingsDraft, panicModeEnabled: event.target.checked })
+            }
+            type="checkbox"
+          />
+          Panic/Fallback Mode
+        </label>
+        <label className="checkbox-row">
+          <input
+            checked={settingsDraft.aiOnCaptureEnabled}
+            onChange={(event) =>
+              setSettingsDraft({ ...settingsDraft, aiOnCaptureEnabled: event.target.checked })
+            }
+            type="checkbox"
+          />
+          LLM capture analysis
+        </label>
+        <button
+          className="primary-button"
+          onClick={() =>
+            void onSaveSettings(
+              {
+                acceptableCommuteMinutes: parseIntegerDraft(settingsDraft.acceptableCommuteMinutes, settings.acceptableCommuteMinutes),
+                aiOnCaptureEnabled: settingsDraft.aiOnCaptureEnabled,
+                defaultBedroomFilter: settingsDraft.defaultBedroomFilter,
+                idealCommuteMinutes: parseIntegerDraft(settingsDraft.idealCommuteMinutes, settings.idealCommuteMinutes),
+                longWalkMinutes: parseIntegerDraft(settingsDraft.longWalkMinutes, settings.longWalkMinutes),
+                maxMonthlyRent: parseIntegerDraft(settingsDraft.maxMonthlyRent, settings.maxMonthlyRent),
+                officeAddress: settingsDraft.officeAddress,
+                officeName: settingsDraft.officeName,
+                panicModeEnabled: settingsDraft.panicModeEnabled,
+                targetEnd: settingsDraft.targetEnd,
+                targetStartPrimary: settingsDraft.targetStartPrimary,
+                targetStartSecondary: settingsDraft.targetStartSecondary
+              },
+              "Saved settings through local API."
+            )
+          }
+          type="button"
+        >
+          <span aria-hidden="true">s</span>
+          Save settings
+        </button>
       </article>
 
       <article className="settings-panel">
         <p className="eyebrow">Local API contract</p>
-        <h3>Ready for backend wiring</h3>
+        <h3>Exports and session state</h3>
         <p className="section-copy">
-          The web lane exposes a typed client for the planned routes and currently renders with mock
-          data until the API worker is integrated.
+          Export buttons use the API when it is online, then fall back to the current dashboard
+          session so you can still compare listings offline.
         </p>
         <dl className="settings-list">
           <Fact label="Base URL" value={`http://localhost:${DEFAULT_LOCAL_PORTS.api}`} />
           <Fact label="Client" value={defaultApiClient.constructor.name} />
           <Fact label="Visible after filters" value={snapshotCount.toString()} />
+          <Fact label="Current budget" value={formatCurrency(settings.maxMonthlyRent)} />
+          <Fact label="Current dates" value={`${formatDate(settings.targetStartPrimary)} to ${formatDate(settings.targetEnd)}`} />
         </dl>
-        <button
-          className={filters.includeFallback ? "toggle toggle-on" : "toggle"}
-          onClick={() => onFiltersChange({ ...filters, includeFallback: !filters.includeFallback })}
-          type="button"
-        >
-          <span aria-hidden="true">!</span>
-          Panic Mode {filters.includeFallback ? "On" : "Off"}
-        </button>
+        <div className="detail-actions">
+          <button className="text-button" onClick={() => void onExport("csv")} type="button">
+            <span aria-hidden="true">v</span>
+            Export CSV
+          </button>
+          <button className="text-button" onClick={() => void onExport("json")} type="button">
+            <span aria-hidden="true">J</span>
+            Backup JSON
+          </button>
+        </div>
+        <FilterBar filters={filters} onFiltersChange={onFiltersChange} />
       </article>
     </section>
   );
@@ -826,6 +1893,8 @@ function navIcon(view: DashboardView): string {
       return "*";
     case "detail":
       return "#";
+    case "commute":
+      return "~";
     case "settings":
       return "=";
   }
@@ -841,7 +1910,78 @@ function viewTitle(view: DashboardView): string {
       return "Shortlist";
     case "detail":
       return "Listing Detail";
+    case "commute":
+      return "Map and Commute";
     case "settings":
       return "Settings";
   }
+}
+
+function mergeListingPatch(
+  listing: DashboardListing,
+  patch: ListingUpdateRequest
+): DashboardListing {
+  return {
+    ...listing,
+    ...patch,
+    dateWindow: patch.dateWindow
+      ? {
+          ...listing.dateWindow,
+          ...patch.dateWindow
+        }
+      : listing.dateWindow,
+    score: listing.score,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function suggestionToListingPatch(suggestion: CaptureSuggestion): ListingUpdateRequest {
+  switch (suggestion.field) {
+    case "availabilitySummary":
+      return {
+        dateWindow: {
+          availabilitySummary: String(suggestion.value)
+        }
+      };
+    case "bedroomLabel":
+      return {
+        bedroomLabel: String(suggestion.value)
+      };
+    case "monthlyRent":
+      return {
+        monthlyRent:
+          typeof suggestion.value === "number"
+            ? suggestion.value
+            : Number.parseInt(String(suggestion.value).replace(/[^\d]/g, ""), 10)
+      };
+    case "stayType":
+      return {
+        stayType: suggestion.value as DashboardListing["stayType"]
+      };
+    case "userNotes":
+      return {
+        userNotes: String(suggestion.value)
+      };
+    case "location":
+      return {};
+  }
+}
+
+function downloadTextFile(fileName: string, body: string, contentType: string) {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const blob = new Blob([body], { type: contentType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function parseIntegerDraft(value: string, fallback: number): number {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }

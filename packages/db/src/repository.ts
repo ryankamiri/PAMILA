@@ -9,6 +9,9 @@ import { canonicalizeListingUrl, DEFAULT_SEARCH_SETTINGS, type ScoreBreakdown } 
 
 import { runMigrations } from "./migrations.js";
 import {
+  aiAnalyses,
+  commuteEstimates,
+  locations,
   scoreBreakdowns,
   settings,
   listings,
@@ -18,15 +21,23 @@ import {
 } from "./schema.js";
 import type {
   BackupPayload,
+  AiAnalysisRecord,
   CaptureImportInput,
   CaptureRecord,
+  CommuteEstimateRecord,
   CreateListingInput,
   DatabaseOptions,
   ListListingsOptions,
   ListingRecord,
   ListingWithScore,
+  LocationRecord,
+  RestoreBackupResult,
+  SaveAiAnalysisInput,
   SettingsRecord,
+  StatusEventRecord,
   StoredScoreBreakdown,
+  UpsertCommuteEstimateInput,
+  UpsertLocationInput,
   UpdateListingInput
 } from "./types.js";
 import { DEFAULT_SETTINGS_ID } from "./types.js";
@@ -36,6 +47,10 @@ type ListingRow = typeof listings.$inferSelect;
 type SettingsRow = typeof settings.$inferSelect;
 type CaptureRow = typeof sourceCaptures.$inferSelect;
 type ScoreRow = typeof scoreBreakdowns.$inferSelect;
+type LocationRow = typeof locations.$inferSelect;
+type CommuteEstimateRow = typeof commuteEstimates.$inferSelect;
+type AiAnalysisRow = typeof aiAnalyses.$inferSelect;
+type StatusEventRow = typeof statusEvents.$inferSelect;
 
 export class PamilaDatabase {
   readonly db: Db;
@@ -330,12 +345,260 @@ export class PamilaDatabase {
       .map(mapCapture);
   }
 
+  getCapture(id: string): CaptureRecord | null {
+    const row = this.db.select().from(sourceCaptures).where(eq(sourceCaptures.id, id)).get();
+    return row ? mapCapture(row) : null;
+  }
+
+  listCapturesByListing(listingId: string): CaptureRecord[] {
+    return this.db
+      .select()
+      .from(sourceCaptures)
+      .where(eq(sourceCaptures.listingId, listingId))
+      .orderBy(desc(sourceCaptures.capturedAt))
+      .all()
+      .map(mapCapture);
+  }
+
+  listLocations(listingId?: string): LocationRecord[] {
+    const rows = listingId
+      ? this.db
+          .select()
+          .from(locations)
+          .where(eq(locations.listingId, listingId))
+          .orderBy(desc(locations.updatedAt))
+          .all()
+      : this.db.select().from(locations).orderBy(desc(locations.updatedAt)).all();
+
+    return rows.map(mapLocation);
+  }
+
+  getCurrentLocation(listingId: string): LocationRecord | null {
+    return this.listLocations(listingId)[0] ?? null;
+  }
+
+  upsertListingLocation(listingId: string, input: UpsertLocationInput): LocationRecord | null {
+    if (!this.getListing(listingId)) {
+      return null;
+    }
+
+    const existing = this.getCurrentLocation(listingId);
+    const now = new Date().toISOString();
+
+    if (existing) {
+      const values = stripUndefined({
+        address: input.address,
+        confidence: input.confidence,
+        crossStreets: input.crossStreets,
+        geographyCategory: input.geographyCategory,
+        isUserConfirmed: input.isUserConfirmed,
+        label: cleanLocationLabel(input.label, input, existing.label),
+        lat: input.lat,
+        lng: input.lng,
+        neighborhood: input.neighborhood,
+        source: input.source,
+        updatedAt: now
+      });
+
+      this.db.update(locations).set(values).where(eq(locations.id, existing.id)).run();
+      return this.getCurrentLocation(listingId);
+    }
+
+    const values = {
+      address: input.address ?? null,
+      confidence: input.confidence ?? "low",
+      createdAt: now,
+      crossStreets: input.crossStreets ?? null,
+      geographyCategory: input.geographyCategory ?? "unknown",
+      id: randomUUID(),
+      isUserConfirmed: input.isUserConfirmed ?? false,
+      label: cleanLocationLabel(input.label, input, "Unknown location"),
+      lat: input.lat ?? null,
+      listingId,
+      lng: input.lng ?? null,
+      neighborhood: input.neighborhood ?? null,
+      source: input.source ?? "manual_guess",
+      updatedAt: now
+    } satisfies typeof locations.$inferInsert;
+
+    this.db.insert(locations).values(values).run();
+    return mapLocation(values);
+  }
+
+  listCommuteEstimates(listingId?: string): CommuteEstimateRecord[] {
+    const rows = listingId
+      ? this.db
+          .select()
+          .from(commuteEstimates)
+          .where(eq(commuteEstimates.listingId, listingId))
+          .orderBy(desc(commuteEstimates.calculatedAt))
+          .all()
+      : this.db.select().from(commuteEstimates).orderBy(desc(commuteEstimates.calculatedAt)).all();
+
+    return rows.map(mapCommuteEstimate);
+  }
+
+  getCurrentCommuteEstimate(listingId: string): CommuteEstimateRecord | null {
+    return this.listCommuteEstimates(listingId)[0] ?? null;
+  }
+
+  upsertManualCommuteEstimate(
+    listingId: string,
+    input: UpsertCommuteEstimateInput
+  ): CommuteEstimateRecord | null {
+    if (!this.getListing(listingId)) {
+      return null;
+    }
+
+    const existing = this.getCurrentCommuteEstimate(listingId);
+    const calculatedAt = input.calculatedAt ?? new Date().toISOString();
+
+    if (existing) {
+      const values = stripUndefined({
+        calculatedAt,
+        confidence: input.confidence ?? "manual",
+        hasBusHeavyRoute: input.hasBusHeavyRoute,
+        lineNamesJson: input.lineNames === undefined ? undefined : JSON.stringify(input.lineNames),
+        routeSummary: input.routeSummary,
+        totalMinutes: input.totalMinutes,
+        transferCount: input.transferCount,
+        walkMinutes: input.walkMinutes
+      });
+
+      this.db.update(commuteEstimates).set(values).where(eq(commuteEstimates.id, existing.id)).run();
+      return this.getCurrentCommuteEstimate(listingId);
+    }
+
+    const values = {
+      calculatedAt,
+      confidence: input.confidence ?? "manual",
+      hasBusHeavyRoute: input.hasBusHeavyRoute ?? false,
+      id: randomUUID(),
+      lineNamesJson: JSON.stringify(input.lineNames ?? []),
+      listingId,
+      routeSummary: input.routeSummary ?? null,
+      totalMinutes: input.totalMinutes ?? null,
+      transferCount: input.transferCount ?? null,
+      walkMinutes: input.walkMinutes ?? null
+    } satisfies typeof commuteEstimates.$inferInsert;
+
+    this.db.insert(commuteEstimates).values(values).run();
+    return mapCommuteEstimate(values);
+  }
+
+  getAiAnalysisByInputHash(inputHash: string): AiAnalysisRecord | null {
+    const row = this.db
+      .select()
+      .from(aiAnalyses)
+      .where(eq(aiAnalyses.inputHash, inputHash))
+      .orderBy(desc(aiAnalyses.createdAt))
+      .get();
+
+    return row ? mapAiAnalysis(row) : null;
+  }
+
+  listAiAnalyses(listingId?: string): AiAnalysisRecord[] {
+    const rows = listingId
+      ? this.db
+          .select()
+          .from(aiAnalyses)
+          .where(eq(aiAnalyses.listingId, listingId))
+          .orderBy(desc(aiAnalyses.createdAt))
+          .all()
+      : this.db.select().from(aiAnalyses).orderBy(desc(aiAnalyses.createdAt)).all();
+
+    return rows.map(mapAiAnalysis);
+  }
+
+  saveAiAnalysis(input: SaveAiAnalysisInput): AiAnalysisRecord {
+    const values = {
+      analysisJson: JSON.stringify(input.analysis),
+      createdAt: new Date().toISOString(),
+      id: randomUUID(),
+      inputHash: input.inputHash,
+      listingId: input.listingId ?? null,
+      model: input.model ?? null
+    } satisfies typeof aiAnalyses.$inferInsert;
+
+    this.db.insert(aiAnalyses).values(values).run();
+    return mapAiAnalysis(values);
+  }
+
+  listStatusEvents(listingId?: string): StatusEventRecord[] {
+    const rows = listingId
+      ? this.db
+          .select()
+          .from(statusEvents)
+          .where(eq(statusEvents.listingId, listingId))
+          .orderBy(desc(statusEvents.createdAt))
+          .all()
+      : this.db.select().from(statusEvents).orderBy(desc(statusEvents.createdAt)).all();
+
+    return rows.map(mapStatusEvent);
+  }
+
   createBackup(): BackupPayload {
     return {
+      aiAnalyses: this.listAiAnalyses(),
+      commuteEstimates: this.listCommuteEstimates(),
       captures: this.listCaptures(),
       exportedAt: new Date().toISOString(),
       listings: this.listListings(),
+      locations: this.listLocations(),
+      statusEvents: this.listStatusEvents(),
       settings: this.getSettings()
+    };
+  }
+
+  restoreBackup(input: BackupPayload): RestoreBackupResult {
+    if (input.settings) {
+      this.updateSettings(input.settings);
+    }
+
+    let listingsRestored = 0;
+    for (const listing of input.listings ?? []) {
+      this.restoreListing(listing);
+      listingsRestored += 1;
+    }
+
+    let capturesRestored = 0;
+    for (const capture of input.captures ?? []) {
+      this.restoreCapture(capture);
+      capturesRestored += 1;
+    }
+
+    let locationsRestored = 0;
+    for (const location of input.locations ?? []) {
+      this.restoreLocation(location);
+      locationsRestored += 1;
+    }
+
+    let commuteEstimatesRestored = 0;
+    for (const estimate of input.commuteEstimates ?? []) {
+      this.restoreCommuteEstimate(estimate);
+      commuteEstimatesRestored += 1;
+    }
+
+    let aiAnalysesRestored = 0;
+    for (const analysis of input.aiAnalyses ?? []) {
+      this.restoreAiAnalysis(analysis);
+      aiAnalysesRestored += 1;
+    }
+
+    let statusEventsRestored = 0;
+    for (const event of input.statusEvents ?? []) {
+      this.restoreStatusEvent(event);
+      statusEventsRestored += 1;
+    }
+
+    return {
+      aiAnalysesRestored,
+      capturesRestored,
+      commuteEstimatesRestored,
+      listingsRestored,
+      locationsRestored,
+      settingsRestored: Boolean(input.settings),
+      statusEventsRestored
     };
   }
 
@@ -376,6 +639,171 @@ export class PamilaDatabase {
         toStatus
       })
       .run();
+  }
+
+  private restoreListing(listing: ListingWithScore) {
+    const canonicalSourceUrl = listing.canonicalSourceUrl || canonicalizeUrlForDb(listing.sourceUrl);
+    const values = {
+      availabilitySummary: listing.availabilitySummary,
+      bathroomType: listing.bathroomType,
+      bedroomCount: listing.bedroomCount,
+      bedroomLabel: listing.bedroomLabel,
+      canonicalSourceUrl,
+      createdAt: listing.createdAt,
+      earliestMoveIn: listing.earliestMoveIn,
+      earliestMoveOut: listing.earliestMoveOut,
+      furnished: listing.furnished,
+      id: listing.id,
+      kitchen: listing.kitchen,
+      knownTotalFees: listing.knownTotalFees,
+      latestMoveIn: listing.latestMoveIn,
+      latestMoveOut: listing.latestMoveOut,
+      monthToMonth: listing.monthToMonth,
+      monthlyRent: listing.monthlyRent,
+      nextAction: listing.nextAction,
+      source: listing.source,
+      sourceUrl: listing.sourceUrl,
+      status: listing.status,
+      stayType: listing.stayType,
+      title: listing.title,
+      updatedAt: listing.updatedAt,
+      userNotes: listing.userNotes,
+      washer: listing.washer
+    } satisfies typeof listings.$inferInsert;
+
+    const existing =
+      this.db.select().from(listings).where(eq(listings.id, listing.id)).get() ??
+      this.db.select().from(listings).where(eq(listings.canonicalSourceUrl, canonicalSourceUrl)).get();
+
+    if (existing) {
+      const { id: _id, ...updateValues } = values;
+      this.db.update(listings).set(updateValues).where(eq(listings.id, existing.id)).run();
+      return;
+    }
+
+    this.db.insert(listings).values(values).run();
+  }
+
+  private restoreCapture(capture: CaptureRecord) {
+    const values = {
+      capturedAt: capture.capturedAt,
+      capturedText: capture.capturedText,
+      capturedTitle: capture.capturedTitle,
+      captureMethod: capture.captureMethod,
+      id: capture.id,
+      listingId: capture.listingId,
+      pageHash: capture.pageHash,
+      selectedText: capture.selectedText,
+      source: capture.source,
+      thumbnailCandidatesJson: JSON.stringify(capture.thumbnailCandidates),
+      url: capture.url,
+      visibleFieldsJson: JSON.stringify(capture.visibleFields)
+    } satisfies typeof sourceCaptures.$inferInsert;
+
+    const existing = this.db.select().from(sourceCaptures).where(eq(sourceCaptures.id, capture.id)).get();
+    if (existing) {
+      const { id: _id, ...updateValues } = values;
+      this.db.update(sourceCaptures).set(updateValues).where(eq(sourceCaptures.id, capture.id)).run();
+      return;
+    }
+
+    this.db.insert(sourceCaptures).values(values).run();
+  }
+
+  private restoreLocation(location: LocationRecord) {
+    const values = {
+      address: location.address,
+      confidence: location.confidence,
+      createdAt: location.createdAt,
+      crossStreets: location.crossStreets,
+      geographyCategory: location.geographyCategory,
+      id: location.id,
+      isUserConfirmed: location.isUserConfirmed,
+      label: location.label,
+      lat: location.lat,
+      listingId: location.listingId,
+      lng: location.lng,
+      neighborhood: location.neighborhood,
+      source: location.source,
+      updatedAt: location.updatedAt
+    } satisfies typeof locations.$inferInsert;
+
+    const existing = this.db.select().from(locations).where(eq(locations.id, location.id)).get();
+    if (existing) {
+      const { id: _id, ...updateValues } = values;
+      this.db.update(locations).set(updateValues).where(eq(locations.id, location.id)).run();
+      return;
+    }
+
+    this.db.insert(locations).values(values).run();
+  }
+
+  private restoreCommuteEstimate(estimate: CommuteEstimateRecord) {
+    const values = {
+      calculatedAt: estimate.calculatedAt,
+      confidence: estimate.confidence,
+      hasBusHeavyRoute: estimate.hasBusHeavyRoute,
+      id: estimate.id,
+      lineNamesJson: JSON.stringify(estimate.lineNames),
+      listingId: estimate.listingId,
+      routeSummary: estimate.routeSummary,
+      totalMinutes: estimate.totalMinutes,
+      transferCount: estimate.transferCount,
+      walkMinutes: estimate.walkMinutes
+    } satisfies typeof commuteEstimates.$inferInsert;
+
+    const existing = this.db
+      .select()
+      .from(commuteEstimates)
+      .where(eq(commuteEstimates.id, estimate.id))
+      .get();
+    if (existing) {
+      const { id: _id, ...updateValues } = values;
+      this.db.update(commuteEstimates).set(updateValues).where(eq(commuteEstimates.id, estimate.id)).run();
+      return;
+    }
+
+    this.db.insert(commuteEstimates).values(values).run();
+  }
+
+  private restoreAiAnalysis(analysis: AiAnalysisRecord) {
+    const values = {
+      analysisJson: JSON.stringify(analysis.analysis),
+      createdAt: analysis.createdAt,
+      id: analysis.id,
+      inputHash: analysis.inputHash,
+      listingId: analysis.listingId,
+      model: analysis.model
+    } satisfies typeof aiAnalyses.$inferInsert;
+
+    const existing = this.db.select().from(aiAnalyses).where(eq(aiAnalyses.id, analysis.id)).get();
+    if (existing) {
+      const { id: _id, ...updateValues } = values;
+      this.db.update(aiAnalyses).set(updateValues).where(eq(aiAnalyses.id, analysis.id)).run();
+      return;
+    }
+
+    this.db.insert(aiAnalyses).values(values).run();
+  }
+
+  private restoreStatusEvent(event: StatusEventRecord) {
+    const values = {
+      createdAt: event.createdAt,
+      fromStatus: event.fromStatus,
+      id: event.id,
+      listingId: event.listingId,
+      note: event.note,
+      toStatus: event.toStatus
+    } satisfies typeof statusEvents.$inferInsert;
+
+    const existing = this.db.select().from(statusEvents).where(eq(statusEvents.id, event.id)).get();
+    if (existing) {
+      const { id: _id, ...updateValues } = values;
+      this.db.update(statusEvents).set(updateValues).where(eq(statusEvents.id, event.id)).run();
+      return;
+    }
+
+    this.db.insert(statusEvents).values(values).run();
   }
 }
 
@@ -484,6 +912,62 @@ function mapCapture(row: CaptureRow): CaptureRecord {
   };
 }
 
+function mapLocation(row: LocationRow): LocationRecord {
+  return {
+    address: row.address,
+    confidence: row.confidence as LocationRecord["confidence"],
+    createdAt: row.createdAt,
+    crossStreets: row.crossStreets,
+    geographyCategory: row.geographyCategory as LocationRecord["geographyCategory"],
+    id: row.id,
+    isUserConfirmed: row.isUserConfirmed,
+    label: row.label,
+    lat: row.lat,
+    listingId: row.listingId,
+    lng: row.lng,
+    neighborhood: row.neighborhood,
+    source: row.source as LocationRecord["source"],
+    updatedAt: row.updatedAt
+  };
+}
+
+function mapCommuteEstimate(row: CommuteEstimateRow): CommuteEstimateRecord {
+  return {
+    calculatedAt: row.calculatedAt,
+    confidence: row.confidence as CommuteEstimateRecord["confidence"],
+    hasBusHeavyRoute: row.hasBusHeavyRoute,
+    id: row.id,
+    lineNames: parseJsonArray<string>(row.lineNamesJson).filter((value): value is string => typeof value === "string"),
+    listingId: row.listingId,
+    routeSummary: row.routeSummary,
+    totalMinutes: row.totalMinutes,
+    transferCount: row.transferCount,
+    walkMinutes: row.walkMinutes
+  };
+}
+
+function mapAiAnalysis(row: AiAnalysisRow): AiAnalysisRecord {
+  return {
+    analysis: parseJsonObjectLoose(row.analysisJson),
+    createdAt: row.createdAt,
+    id: row.id,
+    inputHash: row.inputHash,
+    listingId: row.listingId,
+    model: row.model
+  };
+}
+
+function mapStatusEvent(row: StatusEventRow): StatusEventRecord {
+  return {
+    createdAt: row.createdAt,
+    fromStatus: row.fromStatus,
+    id: row.id,
+    listingId: row.listingId,
+    note: row.note,
+    toStatus: row.toStatus
+  };
+}
+
 function mapScore(row: ScoreRow): StoredScoreBreakdown {
   return {
     amenityScore: row.amenityScore,
@@ -517,6 +1001,15 @@ function parseJsonObject(input: string): Record<string, string> {
   }
 }
 
+function parseJsonObjectLoose(input: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(input);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function parseJsonArray<T = unknown>(input: string): T[] {
   try {
     const parsed = JSON.parse(input);
@@ -529,4 +1022,12 @@ function parseJsonArray<T = unknown>(input: string): T[] {
 function cleanTitle(title: string | null | undefined, source: string) {
   const fallback = source === "airbnb" ? "Untitled Airbnb listing" : "Untitled Leasebreak listing";
   return title?.trim() || fallback;
+}
+
+function cleanLocationLabel(
+  label: string | null | undefined,
+  input: Pick<UpsertLocationInput, "address" | "crossStreets" | "neighborhood">,
+  fallback: string
+) {
+  return label?.trim() || input.address?.trim() || input.crossStreets?.trim() || input.neighborhood?.trim() || fallback;
 }

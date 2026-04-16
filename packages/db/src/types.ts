@@ -1,9 +1,14 @@
 import type {
   BedroomFilter,
   CapturePayload,
+  CommuteSummary,
+  GeographyCategory,
   ListingDateWindow,
+  ListingLocation,
   ListingSource,
   ListingStatus,
+  LocationConfidence,
+  LocationSource,
   SearchSettings,
   ScoreBreakdown,
   StayType
@@ -103,6 +108,63 @@ export interface CaptureRecord {
   capturedAt: string;
 }
 
+export interface LocationRecord extends ListingLocation {
+  id: string;
+  listingId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type UpsertLocationInput = Partial<
+  Pick<LocationRecord, "address" | "crossStreets" | "geographyCategory" | "lat" | "lng" | "neighborhood">
+> & {
+  label?: string | null;
+  source?: LocationSource;
+  confidence?: LocationConfidence;
+  isUserConfirmed?: boolean;
+};
+
+export interface CommuteEstimateRecord extends CommuteSummary {
+  id: string;
+  listingId: string;
+  calculatedAt: string;
+}
+
+export type UpsertCommuteEstimateInput = Partial<
+  Pick<
+    CommuteEstimateRecord,
+    "hasBusHeavyRoute" | "lineNames" | "routeSummary" | "totalMinutes" | "transferCount" | "walkMinutes"
+  >
+> & {
+  confidence?: CommuteSummary["confidence"];
+  calculatedAt?: string;
+};
+
+export interface AiAnalysisRecord {
+  id: string;
+  listingId: string | null;
+  inputHash: string;
+  model: string | null;
+  analysis: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface SaveAiAnalysisInput {
+  listingId?: string | null;
+  inputHash: string;
+  model?: string | null;
+  analysis: Record<string, unknown>;
+}
+
+export interface StatusEventRecord {
+  id: string;
+  listingId: string;
+  fromStatus: string | null;
+  toStatus: string;
+  note: string | null;
+  createdAt: string;
+}
+
 export interface StoredScoreBreakdown extends ScoreBreakdown {
   id: string;
   listingId: string;
@@ -114,6 +176,20 @@ export interface BackupPayload {
   settings: SettingsRecord;
   listings: ListingWithScore[];
   captures: CaptureRecord[];
+  locations?: LocationRecord[];
+  commuteEstimates?: CommuteEstimateRecord[];
+  aiAnalyses?: AiAnalysisRecord[];
+  statusEvents?: StatusEventRecord[];
+}
+
+export interface RestoreBackupResult {
+  settingsRestored: boolean;
+  listingsRestored: number;
+  capturesRestored: number;
+  locationsRestored: number;
+  commuteEstimatesRestored: number;
+  aiAnalysesRestored: number;
+  statusEventsRestored: number;
 }
 
 export interface ListListingsOptions {
@@ -130,3 +206,5 @@ export interface DatabaseOptions {
 export interface RawBedroomFilterUpdate {
   defaultBedroomFilter?: BedroomFilter;
 }
+
+export const GEOGRAPHY_CATEGORIES = ["manhattan", "lic_astoria", "brooklyn", "other", "unknown"] as const satisfies readonly GeographyCategory[];

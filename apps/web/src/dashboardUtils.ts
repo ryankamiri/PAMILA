@@ -1,6 +1,15 @@
-import type { ScoreBreakdown } from "@pamila/core";
+import type { CommuteSummary, ListingLocation, ScoreBreakdown } from "@pamila/core";
 
-import type { DashboardListing, ListingFilters, ManualListingDraft } from "./dashboardTypes";
+import type {
+  CaptureSuggestion,
+  DashboardListing,
+  DashboardSnapshot,
+  ListingBasicsDraft,
+  ListingFilters,
+  ManualCommuteDraft,
+  ManualListingDraft,
+  ManualLocationDraft
+} from "./dashboardTypes";
 
 export const formatCurrency = (value: number | null): string => {
   if (value === null) {
@@ -31,6 +40,19 @@ export const labelize = (value: string): string =>
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+
+export const formatDateTime = (value: string | null | undefined): string => {
+  if (!value) {
+    return "Not checked";
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short"
+  }).format(new Date(value));
+};
 
 export const matchesFilters = (listing: DashboardListing, filters: ListingFilters): boolean => {
   if (!filters.includeFallback && listing.score.hardFilterStatus === "fallback_only") {
@@ -108,6 +130,271 @@ export const getShortlist = (listings: DashboardListing[]): DashboardListing[] =
     .filter((listing) => ["shortlisted", "finalist", "ready_to_review"].includes(listing.status))
     .filter((listing) => listing.score.hardFilterStatus === "included")
     .sort((a, b) => b.score.totalScore - a.score.totalScore);
+
+export const listingToBasicsDraft = (listing: DashboardListing): ListingBasicsDraft => ({
+  availabilitySummary: listing.dateWindow.availabilitySummary ?? "",
+  bedroomCount: listing.bedroomCount === null ? "" : String(listing.bedroomCount),
+  bedroomLabel: listing.bedroomLabel ?? "",
+  monthlyRent: listing.monthlyRent === null ? "" : String(listing.monthlyRent),
+  sourceUrl: listing.sourceUrl,
+  stayType: listing.stayType,
+  title: listing.title,
+  userNotes: listing.userNotes
+});
+
+export const basicsDraftToListingPatch = (
+  draft: ListingBasicsDraft
+): Partial<DashboardListing> => ({
+  bedroomCount: parseNullableNumber(draft.bedroomCount),
+  bedroomLabel: blankToNull(draft.bedroomLabel),
+  dateWindow: {
+    availabilitySummary: blankToNull(draft.availabilitySummary),
+    earliestMoveIn: null,
+    earliestMoveOut: null,
+    latestMoveIn: null,
+    latestMoveOut: null,
+    monthToMonth: false
+  },
+  monthlyRent: parseNullableNumber(draft.monthlyRent),
+  sourceUrl: draft.sourceUrl.trim(),
+  stayType: draft.stayType,
+  title: draft.title.trim() || "Untitled listing",
+  userNotes: draft.userNotes.trim()
+});
+
+export const listingToLocationDraft = (listing: DashboardListing): ManualLocationDraft => ({
+  address: listing.location?.address ?? "",
+  confidenceLabel: listing.location
+    ? confidenceLabelFromLocation(listing.location)
+    : "unknown",
+  crossStreets: listing.location?.crossStreets ?? "",
+  neighborhood: listing.location?.neighborhood ?? "",
+  sourceLabel: listing.locationSourceLabel ?? sourceLabelFromLocation(listing.location, listing.source)
+});
+
+export const locationDraftToLocation = (
+  draft: ManualLocationDraft
+): ListingLocation | null => {
+  const address = draft.address.trim();
+  const crossStreets = draft.crossStreets.trim();
+  const neighborhood = draft.neighborhood.trim();
+  const label = address || crossStreets || neighborhood;
+
+  if (!label && draft.confidenceLabel === "unknown") {
+    return null;
+  }
+
+  return {
+    address: address || null,
+    confidence: coreConfidenceFromLabel(draft.confidenceLabel),
+    crossStreets: crossStreets || null,
+    geographyCategory: geographyFromText(`${address} ${crossStreets} ${neighborhood}`),
+    isUserConfirmed: draft.sourceLabel === "user_confirmed",
+    label: label || "Unknown location",
+    lat: null,
+    lng: null,
+    neighborhood: neighborhood || null,
+    source: coreSourceFromLabels(draft.sourceLabel, draft.confidenceLabel)
+  };
+};
+
+export const listingToCommuteDraft = (listing: DashboardListing): ManualCommuteDraft => ({
+  hasBusHeavyRoute: listing.commute?.hasBusHeavyRoute ?? false,
+  lastCheckedAt: listing.lastCommuteCheckedAt ?? "",
+  lineNames: listing.commute?.lineNames.join(", ") ?? "",
+  routeSummary: listing.commute?.routeSummary ?? "",
+  totalMinutes: listing.commute?.totalMinutes === null || listing.commute?.totalMinutes === undefined
+    ? ""
+    : String(listing.commute.totalMinutes),
+  transferCount:
+    listing.commute?.transferCount === null || listing.commute?.transferCount === undefined
+      ? ""
+      : String(listing.commute.transferCount),
+  walkMinutes:
+    listing.commute?.walkMinutes === null || listing.commute?.walkMinutes === undefined
+      ? ""
+      : String(listing.commute.walkMinutes)
+});
+
+export const commuteDraftToSummary = (draft: ManualCommuteDraft): CommuteSummary | null => {
+  const totalMinutes = parseNullableNumber(draft.totalMinutes);
+  const walkMinutes = parseNullableNumber(draft.walkMinutes);
+  const transferCount = parseNullableNumber(draft.transferCount);
+  const lineNames = draft.lineNames
+    .split(",")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (
+    totalMinutes === null &&
+    walkMinutes === null &&
+    transferCount === null &&
+    !draft.routeSummary.trim() &&
+    lineNames.length === 0
+  ) {
+    return null;
+  }
+
+  return {
+    confidence: "manual",
+    hasBusHeavyRoute: draft.hasBusHeavyRoute,
+    lineNames,
+    routeSummary: draft.routeSummary.trim() || null,
+    totalMinutes,
+    transferCount,
+    walkMinutes
+  };
+};
+
+export const getMissingFinalistBlockers = (listing: DashboardListing): string[] => {
+  const blockers: string[] = [];
+
+  if (listing.monthlyRent === null) {
+    blockers.push("price");
+  }
+
+  if (
+    !listing.dateWindow.availabilitySummary &&
+    !listing.dateWindow.earliestMoveIn &&
+    !listing.dateWindow.latestMoveOut
+  ) {
+    blockers.push("dates");
+  }
+
+  if (listing.stayType === "unknown") {
+    blockers.push("stay type");
+  }
+
+  if (!listing.location) {
+    blockers.push("location");
+  }
+
+  return blockers;
+};
+
+export const applyCaptureSuggestionToListing = (
+  listing: DashboardListing,
+  suggestion: CaptureSuggestion
+): DashboardListing => {
+  const now = new Date().toISOString();
+
+  switch (suggestion.field) {
+    case "monthlyRent":
+      return {
+        ...listing,
+        monthlyRent: typeof suggestion.value === "number" ? suggestion.value : parseNullableNumber(String(suggestion.value)),
+        updatedAt: now
+      };
+    case "stayType":
+      return {
+        ...listing,
+        stayType: suggestion.value as DashboardListing["stayType"],
+        updatedAt: now
+      };
+    case "bedroomLabel":
+      return {
+        ...listing,
+        bedroomLabel: String(suggestion.value),
+        updatedAt: now
+      };
+    case "availabilitySummary":
+      return {
+        ...listing,
+        dateWindow: {
+          ...listing.dateWindow,
+          availabilitySummary: String(suggestion.value)
+        },
+        updatedAt: now
+      };
+    case "location": {
+      const location = locationDraftToLocation(suggestion.value as ManualLocationDraft);
+      return {
+        ...listing,
+        location,
+        locationSourceLabel: (suggestion.value as ManualLocationDraft).sourceLabel,
+        updatedAt: now
+      };
+    }
+    case "userNotes":
+      return {
+        ...listing,
+        updatedAt: now,
+        userNotes: [listing.userNotes, String(suggestion.value)].filter(Boolean).join("\n")
+      };
+  }
+};
+
+export const markCaptureSuggestion = (
+  listing: DashboardListing,
+  suggestionId: string,
+  result: "applied" | "rejected"
+): DashboardListing => {
+  if (!listing.captureReview) {
+    return listing;
+  }
+
+  return {
+    ...listing,
+    captureReview: {
+      ...listing.captureReview,
+      suggestions: listing.captureReview.suggestions.map((suggestion) =>
+        suggestion.id === suggestionId
+          ? {
+              ...suggestion,
+              applied: result === "applied",
+              rejected: result === "rejected"
+            }
+          : suggestion
+      )
+    }
+  };
+};
+
+export const createLocalCsvExport = (listings: DashboardListing[]): string => {
+  const headers = [
+    "id",
+    "source",
+    "title",
+    "sourceUrl",
+    "monthlyRent",
+    "stayType",
+    "bedroom",
+    "status",
+    "totalScore",
+    "hardFilterStatus",
+    "location",
+    "commuteMinutes",
+    "nextAction"
+  ];
+
+  const rows = listings.map((listing) => [
+    listing.id,
+    listing.source,
+    listing.title,
+    listing.sourceUrl,
+    listing.monthlyRent ?? "",
+    listing.stayType,
+    listing.bedroomLabel ?? "",
+    listing.status,
+    listing.score.totalScore,
+    listing.score.hardFilterStatus,
+    listing.location?.label ?? "",
+    listing.commute?.totalMinutes ?? "",
+    listing.nextAction
+  ]);
+
+  return [headers, ...rows].map((row) => row.map(csvCell).join(",")).join("\n");
+};
+
+export const createLocalBackupExport = (snapshot: DashboardSnapshot): string =>
+  JSON.stringify(
+    {
+      exportedAt: new Date().toISOString(),
+      ...snapshot
+    },
+    null,
+    2
+  );
 
 const pendingScore = (reason: string): ScoreBreakdown => ({
   amenityScore: 0,
@@ -189,3 +476,113 @@ export const createManualListing = (
     washer: "unknown"
   };
 };
+
+function parseNullableNumber(value: string): number | null {
+  const parsed = Number.parseFloat(value.replace(/[^\d.]/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function blankToNull(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function coreConfidenceFromLabel(label: ManualLocationDraft["confidenceLabel"]) {
+  switch (label) {
+    case "exact":
+      return "exact";
+    case "cross_street":
+      return "high";
+    case "neighborhood":
+      return "medium";
+    case "approximate":
+      return "medium";
+    case "unknown":
+      return "low";
+  }
+}
+
+function confidenceLabelFromLocation(location: ListingLocation): ManualLocationDraft["confidenceLabel"] {
+  if (location.confidence === "exact") {
+    return "exact";
+  }
+
+  if (location.source === "cross_streets") {
+    return "cross_street";
+  }
+
+  if (location.source === "airbnb_approx_pin") {
+    return "approximate";
+  }
+
+  if (location.source === "neighborhood") {
+    return "neighborhood";
+  }
+
+  return location.confidence === "low" ? "unknown" : "neighborhood";
+}
+
+function sourceLabelFromLocation(
+  location: ListingLocation | null,
+  listingSource: DashboardListing["source"]
+): ManualLocationDraft["sourceLabel"] {
+  if (!location) {
+    return "captured_text";
+  }
+
+  if (location.source === "airbnb_approx_pin") {
+    return "airbnb_approximate";
+  }
+
+  if (location.isUserConfirmed || location.source === "exact_address" || location.source === "cross_streets") {
+    return "user_confirmed";
+  }
+
+  return listingSource === "leasebreak" ? "leasebreak" : "captured_text";
+}
+
+function coreSourceFromLabels(
+  sourceLabel: ManualLocationDraft["sourceLabel"],
+  confidenceLabel: ManualLocationDraft["confidenceLabel"]
+): ListingLocation["source"] {
+  if (sourceLabel === "airbnb_approximate") {
+    return "airbnb_approx_pin";
+  }
+
+  if (confidenceLabel === "exact") {
+    return "exact_address";
+  }
+
+  if (confidenceLabel === "cross_street") {
+    return "cross_streets";
+  }
+
+  if (confidenceLabel === "neighborhood") {
+    return "neighborhood";
+  }
+
+  return "manual_guess";
+}
+
+function geographyFromText(value: string): ListingLocation["geographyCategory"] {
+  const text = value.toLowerCase();
+
+  if (/(chelsea|nomad|village|soho|tribeca|harlem|uws|ues|manhattan|midtown|flatiron|gramercy)/.test(text)) {
+    return "manhattan";
+  }
+
+  if (/(lic|long island city|astoria|court sq|court square)/.test(text)) {
+    return "lic_astoria";
+  }
+
+  if (/(brooklyn|greenpoint|williamsburg|fort greene|downtown brooklyn|bed-stuy)/.test(text)) {
+    return "brooklyn";
+  }
+
+  return "unknown";
+}
+
+function csvCell(value: unknown) {
+  const stringValue = String(value);
+  return /[",\n]/.test(stringValue) ? `"${stringValue.replaceAll('"', '""')}"` : stringValue;
+}

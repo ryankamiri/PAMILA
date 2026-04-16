@@ -4,21 +4,25 @@ import {
   type ScoreBreakdown,
   type SearchSettings
 } from "@pamila/core";
-import type { ListingRecord } from "@pamila/db";
+import type { CommuteEstimateRecord, ListingRecord, LocationRecord } from "@pamila/db";
 
 export function calculateListingScore(
   listing: ListingRecord,
-  settings: SearchSettings
+  settings: SearchSettings,
+  context: { commute?: CommuteEstimateRecord | null; location?: LocationRecord | null } = {}
 ): ScoreBreakdown {
-  return calculatePamilaScore(toListingEvaluationInput(listing), settings);
+  return calculatePamilaScore(toListingEvaluationInput(listing, context), settings);
 }
 
-function toListingEvaluationInput(listing: ListingRecord): ListingEvaluationInput {
+function toListingEvaluationInput(
+  listing: ListingRecord,
+  context: { commute?: CommuteEstimateRecord | null; location?: LocationRecord | null }
+): ListingEvaluationInput {
   return {
     bathroomType: listing.bathroomType,
     bedroomCount: listing.bedroomCount,
     bedroomLabel: listing.bedroomLabel,
-    commute: null,
+    commute: context.commute ?? null,
     dateWindow: {
       availabilitySummary: listing.availabilitySummary,
       earliestMoveIn: listing.earliestMoveIn,
@@ -30,7 +34,7 @@ function toListingEvaluationInput(listing: ListingRecord): ListingEvaluationInpu
     furnished: listing.furnished,
     id: listing.id,
     kitchen: listing.kitchen,
-    location: null,
+    location: context.location ?? null,
     monthlyRent: listing.monthlyRent,
     source: listing.source,
     sourceUrl: listing.sourceUrl,

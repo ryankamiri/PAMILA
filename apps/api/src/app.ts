@@ -1,13 +1,17 @@
-import Fastify, { type FastifyReply } from "fastify";
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import {
   connectPamilaDb,
+  type BackupPayload,
   type CaptureImportInput,
+  type CaptureRecord,
   type CreateListingInput,
   type ListListingsOptions,
   type ListingRecord,
   type ListingWithScore,
   type PamilaDatabase,
   type SettingsRecord,
+  type UpsertCommuteEstimateInput,
+  type UpsertLocationInput,
   type UpdateListingInput
 } from "@pamila/db";
 import {
@@ -21,12 +25,20 @@ import {
   type StayType
 } from "@pamila/core";
 
+import {
+  analyzeCaptureWithOpenAI,
+  buildCaptureCleanupSuggestions,
+  type CaptureCleanupSuggestions
+} from "./captureAnalysis.js";
 import { loadApiConfig } from "./config.js";
 import { calculateListingScore } from "./scoring.js";
 
 export interface BuildAppOptions {
   db?: PamilaDatabase;
   databaseUrl?: string;
+  fetchImpl?: typeof fetch;
+  openAiApiKey?: string | null;
+  openAiModel?: string;
   token?: string;
 }
 
@@ -34,6 +46,8 @@ export function buildApp(options: BuildAppOptions = {}) {
   const config = loadApiConfig();
   const db = options.db ?? connectPamilaDb({ databaseUrl: options.databaseUrl ?? config.databaseUrl });
   const localToken = options.token ?? config.localToken;
+  const openAiApiKey = "openAiApiKey" in options ? options.openAiApiKey : config.openAiApiKey;
+  const openAiModel = options.openAiModel ?? config.openAiModel;
   const ownsDb = !options.db;
 
   const app = Fastify({
@@ -95,7 +109,7 @@ export function buildApp(options: BuildAppOptions = {}) {
     }
 
     return {
-      listings: db.listListings(options)
+      listings: db.listListings(options).map((listing) => listingForResponse(db, listing))
     };
   });
 
@@ -116,7 +130,67 @@ export function buildApp(options: BuildAppOptions = {}) {
     if (!listing) {
       return notFound(reply, "Listing not found.");
     }
-    return { listing };
+    return { listing: listingForResponse(db, listing) };
+  });
+
+  app.get("/api/listings/:id/location", async (request, reply) => {
+    const id = getRouteId(request.params);
+    if (!db.getListing(id)) {
+      return notFound(reply, "Listing not found.");
+    }
+
+    return {
+      location: db.getCurrentLocation(id)
+    };
+  });
+
+  app.put("/api/listings/:id/location", async (request, reply) => {
+    const id = getRouteId(request.params);
+    const input = coerceLocationUpdate(asObject(request.body));
+    const location = db.upsertListingLocation(id, input);
+    if (!location) {
+      return notFound(reply, "Listing not found.");
+    }
+
+    const listing = recalculateListing(db, id);
+    return reply.send({ listing, location });
+  });
+
+  app.get("/api/listings/:id/commute", async (request, reply) => {
+    const id = getRouteId(request.params);
+    if (!db.getListing(id)) {
+      return notFound(reply, "Listing not found.");
+    }
+
+    return {
+      commute: db.getCurrentCommuteEstimate(id)
+    };
+  });
+
+  const updateCommuteHandler = async (request: FastifyRequest, reply: FastifyReply) => {
+    const id = getRouteId(request.params);
+    const input = coerceCommuteUpdate(asObject(request.body));
+    const commute = db.upsertManualCommuteEstimate(id, input);
+    if (!commute) {
+      return notFound(reply, "Listing not found.");
+    }
+
+    const listing = recalculateListing(db, id);
+    return reply.send({ commute, listing });
+  };
+
+  app.put("/api/listings/:id/commute", updateCommuteHandler);
+  app.put("/api/listings/:id/commute/manual", updateCommuteHandler);
+
+  app.get("/api/listings/:id/captures", async (request, reply) => {
+    const id = getRouteId(request.params);
+    if (!db.getListing(id)) {
+      return notFound(reply, "Listing not found.");
+    }
+
+    return {
+      captures: db.listCapturesByListing(id)
+    };
   });
 
   app.patch("/api/listings/:id", async (request, reply) => {
@@ -140,6 +214,53 @@ export function buildApp(options: BuildAppOptions = {}) {
     return reply.code(204).send();
   });
 
+  app.get("/api/captures", async () => ({
+    captures: db.listCaptures()
+  }));
+
+  app.get("/api/captures/:id", async (request, reply) => {
+    const id = getRouteId(request.params);
+    const capture = db.getCapture(id);
+    if (!capture) {
+      return notFound(reply, "Capture not found.");
+    }
+
+    return { capture };
+  });
+
+  app.get("/api/captures/:id/cleanup-suggestions", async (request, reply) => {
+    const id = getRouteId(request.params);
+    const capture = db.getCapture(id);
+    if (!capture) {
+      return notFound(reply, "Capture not found.");
+    }
+
+    return {
+      suggestions: buildCaptureCleanupSuggestions(capture)
+    };
+  });
+
+  app.post("/api/captures/:id/analyze", async (request, reply) => {
+    const id = getRouteId(request.params);
+    const capture = db.getCapture(id);
+    if (!capture) {
+      return notFound(reply, "Capture not found.");
+    }
+
+    try {
+      return await analyzeCaptureForResponse(db, capture, {
+        fetchImpl: options.fetchImpl,
+        openAiApiKey,
+        openAiModel
+      });
+    } catch (error) {
+      return reply.code(502).send({
+        error: "openai_analysis_failed",
+        message: error instanceof Error ? error.message : "OpenAI analysis failed."
+      });
+    }
+  });
+
   app.post("/api/captures", async (request, reply) => {
     const input = coerceCaptureImport(asObject(request.body));
     if (!input.ok) {
@@ -147,10 +268,20 @@ export function buildApp(options: BuildAppOptions = {}) {
     }
 
     const imported = db.importCapture(input.value);
+    const suggestions = buildCaptureCleanupSuggestions(imported.capture);
+    applyCaptureSuggestions(db, imported.listing, suggestions, input.value.approxLocation);
     const listing = recalculateListing(db, imported.listing.id);
+    const analysis = await maybeAnalyzeCaptureOnImport(db, imported.capture, {
+      fetchImpl: options.fetchImpl,
+      openAiApiKey,
+      openAiModel
+    });
+
     return reply.code(201).send({
+      analysis,
       capture: imported.capture,
-      listing
+      listing,
+      suggestions
     });
   });
 
@@ -166,8 +297,10 @@ export function buildApp(options: BuildAppOptions = {}) {
   app.post("/api/scores/recalculate", async () => {
     const listings = db
       .listListings()
-      .map((listing) => recalculateListing(db, listing.id))
-      .filter((listing): listing is ListingWithScore => listing !== null);
+      .flatMap((listing) => {
+        const recalculated = recalculateListing(db, listing.id);
+        return recalculated ? [recalculated] : [];
+      });
 
     return {
       listings,
@@ -187,6 +320,26 @@ export function buildApp(options: BuildAppOptions = {}) {
     return backup;
   });
 
+  app.post("/api/import/backup", async (request, reply) => {
+    const input = coerceBackupPayload(asObject(request.body));
+    if (!input.ok) {
+      return badRequest(reply, input.message);
+    }
+
+    const result = db.restoreBackup(input.value);
+    const listings = db
+      .listListings()
+      .flatMap((listing) => {
+        const recalculated = recalculateListing(db, listing.id);
+        return recalculated ? [recalculated] : [];
+      });
+
+    return reply.send({
+      listings,
+      restored: result
+    });
+  });
+
   return app;
 }
 
@@ -196,9 +349,172 @@ function recalculateListing(db: PamilaDatabase, id: string) {
     return null;
   }
 
-  const scoreBreakdown = calculateListingScore(listing, db.getSettings());
+  const scoreBreakdown = calculateListingScore(listing, db.getSettings(), {
+    commute: db.getCurrentCommuteEstimate(id),
+    location: db.getCurrentLocation(id)
+  });
   db.saveScoreBreakdown(id, scoreBreakdown);
-  return db.getListing(id);
+  const scoredListing = db.getListing(id);
+  return scoredListing ? listingForResponse(db, scoredListing) : null;
+}
+
+function listingForResponse(db: PamilaDatabase, listing: ListingWithScore) {
+  const commute = db.getCurrentCommuteEstimate(listing.id);
+  return {
+    ...listing,
+    commute,
+    commuteEstimate: commute,
+    lastCommuteCheckedAt: commute?.calculatedAt ?? null,
+    location: db.getCurrentLocation(listing.id)
+  };
+}
+
+interface CaptureAnalysisRuntimeOptions {
+  fetchImpl?: typeof fetch | undefined;
+  openAiApiKey: string | null | undefined;
+  openAiModel: string;
+}
+
+function applyCaptureSuggestions(
+  db: PamilaDatabase,
+  listing: ListingWithScore,
+  suggestions: CaptureCleanupSuggestions,
+  approxLocation: CaptureImportInput["approxLocation"]
+) {
+  const patch = missingOnlyListingPatch(listing, suggestions.suggestedListingUpdate);
+  if (Object.keys(patch).length > 0) {
+    db.updateListing(listing.id, patch);
+  }
+
+  if (!db.getCurrentLocation(listing.id)) {
+    if (approxLocation) {
+      db.upsertListingLocation(listing.id, {
+        address: approxLocation.address,
+        confidence: approxLocation.confidence,
+        crossStreets: approxLocation.crossStreets,
+        geographyCategory: approxLocation.geographyCategory,
+        isUserConfirmed: approxLocation.isUserConfirmed,
+        label: approxLocation.label,
+        lat: approxLocation.lat,
+        lng: approxLocation.lng,
+        neighborhood: approxLocation.neighborhood,
+        source: approxLocation.source
+      });
+    } else if (suggestions.locationSuggestion) {
+      db.upsertListingLocation(listing.id, suggestions.locationSuggestion);
+    }
+  }
+}
+
+function missingOnlyListingPatch(
+  listing: ListingWithScore,
+  suggestions: UpdateListingInput
+): UpdateListingInput {
+  const patch: UpdateListingInput = {};
+
+  if (isBlankTitle(listing.title) && suggestions.title !== undefined) patch.title = suggestions.title;
+  if (listing.monthlyRent === null && suggestions.monthlyRent !== undefined) patch.monthlyRent = suggestions.monthlyRent;
+  if (listing.knownTotalFees === null && suggestions.knownTotalFees !== undefined) patch.knownTotalFees = suggestions.knownTotalFees;
+  if (listing.stayType === "unknown" && suggestions.stayType !== undefined) patch.stayType = suggestions.stayType;
+  if (listing.bedroomCount === null && suggestions.bedroomCount !== undefined) patch.bedroomCount = suggestions.bedroomCount;
+  if (listing.bedroomLabel === null && suggestions.bedroomLabel !== undefined) patch.bedroomLabel = suggestions.bedroomLabel;
+  if (listing.bathroomType === "unknown" && suggestions.bathroomType !== undefined) patch.bathroomType = suggestions.bathroomType;
+  if (listing.kitchen === "unknown" && suggestions.kitchen !== undefined) patch.kitchen = suggestions.kitchen;
+  if (listing.washer === "unknown" && suggestions.washer !== undefined) patch.washer = suggestions.washer;
+  if (listing.furnished === "unknown" && suggestions.furnished !== undefined) patch.furnished = suggestions.furnished;
+  if (listing.availabilitySummary === null && suggestions.availabilitySummary !== undefined) {
+    patch.availabilitySummary = suggestions.availabilitySummary;
+  }
+  if (listing.earliestMoveIn === null && suggestions.earliestMoveIn !== undefined) patch.earliestMoveIn = suggestions.earliestMoveIn;
+  if (listing.latestMoveIn === null && suggestions.latestMoveIn !== undefined) patch.latestMoveIn = suggestions.latestMoveIn;
+  if (listing.earliestMoveOut === null && suggestions.earliestMoveOut !== undefined) patch.earliestMoveOut = suggestions.earliestMoveOut;
+  if (listing.latestMoveOut === null && suggestions.latestMoveOut !== undefined) patch.latestMoveOut = suggestions.latestMoveOut;
+  if (!listing.monthToMonth && suggestions.monthToMonth !== undefined) patch.monthToMonth = suggestions.monthToMonth;
+  if (!listing.nextAction && suggestions.nextAction !== undefined) patch.nextAction = suggestions.nextAction;
+
+  return patch;
+}
+
+async function maybeAnalyzeCaptureOnImport(
+  db: PamilaDatabase,
+  capture: CaptureRecord,
+  options: CaptureAnalysisRuntimeOptions
+) {
+  if (!db.getSettings().aiOnCaptureEnabled || !options.openAiApiKey) {
+    return null;
+  }
+
+  try {
+    return await analyzeCaptureForResponse(db, capture, options);
+  } catch {
+    return {
+      cached: false,
+      enabled: true,
+      error: "OpenAI analysis failed; deterministic suggestions were still saved.",
+      source: "openai"
+    };
+  }
+}
+
+async function analyzeCaptureForResponse(
+  db: PamilaDatabase,
+  capture: CaptureRecord,
+  options: CaptureAnalysisRuntimeOptions
+) {
+  const suggestions = buildCaptureCleanupSuggestions(capture);
+
+  if (!db.getSettings().aiOnCaptureEnabled) {
+    return {
+      analysis: null,
+      cached: false,
+      enabled: false,
+      reason: "ai_disabled",
+      suggestions
+    };
+  }
+
+  if (!options.openAiApiKey) {
+    return {
+      analysis: null,
+      cached: false,
+      enabled: false,
+      reason: "missing_openai_api_key",
+      suggestions
+    };
+  }
+
+  const cached = db.getAiAnalysisByInputHash(suggestions.inputHash);
+  if (cached) {
+    return {
+      analysis: cached,
+      cached: true,
+      enabled: true,
+      suggestions
+    };
+  }
+
+  const openAiAnalysis = await analyzeCaptureWithOpenAI(capture, suggestions, {
+    apiKey: options.openAiApiKey,
+    fetchImpl: options.fetchImpl,
+    model: options.openAiModel
+  });
+  const analysis = db.saveAiAnalysis({
+    analysis: openAiAnalysis as Record<string, unknown>,
+    inputHash: suggestions.inputHash,
+    listingId: capture.listingId,
+    model: options.openAiModel
+  });
+
+  return {
+    analysis,
+    cached: false,
+    enabled: true,
+    suggestions
+  };
+}
+
+function isBlankTitle(title: string) {
+  return /^untitled\b/i.test(title.trim());
 }
 
 function coerceCreateListing(body: Record<string, unknown>):
@@ -291,6 +607,40 @@ function coerceSettingsUpdate(body: Record<string, unknown>) {
   }) satisfies Partial<Omit<SettingsRecord, "createdAt" | "id" | "updatedAt">>;
 }
 
+function coerceLocationUpdate(rawBody: Record<string, unknown>): UpsertLocationInput {
+  const nestedLocation = asObject(rawBody.location);
+  const body = Object.keys(nestedLocation).length > 0 ? nestedLocation : rawBody;
+
+  return compact({
+    address: nullableStringValue(body.address),
+    confidence: locationConfidenceValue(body.confidence),
+    crossStreets: nullableStringValue(body.crossStreets),
+    geographyCategory: geographyCategoryValue(body.geographyCategory),
+    isUserConfirmed: booleanValue(body.isUserConfirmed),
+    label: nullableStringValue(body.label),
+    lat: nullableNumberValue(body.lat),
+    lng: nullableNumberValue(body.lng),
+    neighborhood: nullableStringValue(body.neighborhood),
+    source: locationSourceValue(body.source)
+  });
+}
+
+function coerceCommuteUpdate(rawBody: Record<string, unknown>): UpsertCommuteEstimateInput {
+  const nestedCommute = asObject(rawBody.commute);
+  const body = Object.keys(nestedCommute).length > 0 ? nestedCommute : rawBody;
+
+  return compact({
+    calculatedAt: stringValue(body.calculatedAt) ?? stringValue(rawBody.checkedAt),
+    confidence: commuteConfidenceValue(body.confidence) ?? "manual",
+    hasBusHeavyRoute: booleanValue(body.hasBusHeavyRoute),
+    lineNames: stringArrayValue(body.lineNames),
+    routeSummary: nullableStringValue(body.routeSummary),
+    totalMinutes: nullableNumberValue(body.totalMinutes),
+    transferCount: nullableNumberValue(body.transferCount),
+    walkMinutes: nullableNumberValue(body.walkMinutes)
+  });
+}
+
 function coerceCaptureImport(body: Record<string, unknown>):
   | { ok: true; value: CaptureImportInput }
   | { ok: false; message: string } {
@@ -311,7 +661,7 @@ function coerceCaptureImport(body: Record<string, unknown>):
   return {
     ok: true,
     value: {
-      approxLocation: null,
+      approxLocation: listingLocationValue(body.approxLocation),
       captureMethod:
         body.captureMethod === "manual_form" || body.captureMethod === "manual_paste"
           ? body.captureMethod
@@ -325,6 +675,22 @@ function coerceCaptureImport(body: Record<string, unknown>):
       visibleFields: visibleFieldsValue(body.visibleFields),
       ...optionalCaptureFields
     }
+  };
+}
+
+function coerceBackupPayload(body: Record<string, unknown>):
+  | { ok: true; value: BackupPayload }
+  | { ok: false; message: string } {
+  if (!Array.isArray(body.listings)) {
+    return { ok: false, message: "backup listings array is required." };
+  }
+  if (!body.settings || typeof body.settings !== "object" || Array.isArray(body.settings)) {
+    return { ok: false, message: "backup settings object is required." };
+  }
+
+  return {
+    ok: true,
+    value: body as unknown as BackupPayload
   };
 }
 
@@ -456,6 +822,64 @@ function washerValue(input: unknown): "in_unit" | "in_building" | "nearby" | "no
     input === "unknown"
     ? input
     : undefined;
+}
+
+function geographyCategoryValue(input: unknown): UpsertLocationInput["geographyCategory"] | undefined {
+  return input === "manhattan" ||
+    input === "lic_astoria" ||
+    input === "brooklyn" ||
+    input === "other" ||
+    input === "unknown"
+    ? input
+    : undefined;
+}
+
+function locationSourceValue(input: unknown): UpsertLocationInput["source"] | undefined {
+  return input === "exact_address" ||
+    input === "cross_streets" ||
+    input === "airbnb_approx_pin" ||
+    input === "neighborhood" ||
+    input === "manual_guess"
+    ? input
+    : undefined;
+}
+
+function locationConfidenceValue(input: unknown): UpsertLocationInput["confidence"] | undefined {
+  return input === "exact" || input === "high" || input === "medium" || input === "low"
+    ? input
+    : undefined;
+}
+
+function commuteConfidenceValue(input: unknown): UpsertCommuteEstimateInput["confidence"] | undefined {
+  return input === "exact" || input === "estimated" || input === "manual" ? input : undefined;
+}
+
+function stringArrayValue(input: unknown): string[] | undefined {
+  if (!Array.isArray(input)) {
+    return undefined;
+  }
+  return input.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+}
+
+function listingLocationValue(input: unknown): CaptureImportInput["approxLocation"] {
+  const object = asObject(input);
+  const label = stringValue(object.label);
+  if (!label) {
+    return null;
+  }
+
+  return {
+    address: nullableStringValue(object.address) ?? null,
+    confidence: locationConfidenceValue(object.confidence) ?? "low",
+    crossStreets: nullableStringValue(object.crossStreets) ?? null,
+    geographyCategory: geographyCategoryValue(object.geographyCategory) ?? "unknown",
+    isUserConfirmed: booleanValue(object.isUserConfirmed) ?? false,
+    label,
+    lat: nullableNumberValue(object.lat) ?? null,
+    lng: nullableNumberValue(object.lng) ?? null,
+    neighborhood: nullableStringValue(object.neighborhood) ?? null,
+    source: locationSourceValue(object.source) ?? "airbnb_approx_pin"
+  };
 }
 
 function visibleFieldsValue(input: unknown): Record<string, string> {

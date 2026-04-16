@@ -1,9 +1,24 @@
 import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import { APP_NAME } from "./appConfig";
+import { App } from "./App";
 import { PamilaApiClient } from "./apiClient";
-import { createManualListing, getDailyQueue, getShortlist, matchesFilters } from "./dashboardUtils";
-import { emptyManualListingDraft, mockDashboardListings } from "./mockData";
+import {
+  applyCaptureSuggestionToListing,
+  commuteDraftToSummary,
+  createLocalBackupExport,
+  createLocalCsvExport,
+  createManualListing,
+  getDailyQueue,
+  getMissingFinalistBlockers,
+  getShortlist,
+  listingToCommuteDraft,
+  locationDraftToLocation,
+  matchesFilters
+} from "./dashboardUtils";
+import { emptyManualListingDraft, initialDashboardSnapshot, mockDashboardListings } from "./mockData";
 
 describe("web dashboard lane", () => {
   it("uses the PAMILA app name", () => {
@@ -98,5 +113,252 @@ describe("web dashboard lane", () => {
     const headers = (options as RequestInit).headers as Headers;
     expect(headers.get("X-PAMILA-Token")).toBe("local-token");
     expect(calls[0]?.[0]).toBe("http://localhost:7410/api/listings");
+  });
+
+  it("renders the manual MVP controls on the dashboard shell", () => {
+    const markup = renderToStaticMarkup(createElement(App));
+
+    expect(markup).toContain("Export CSV");
+    expect(markup).toContain("Backup");
+    expect(markup).toContain("Map/Commute");
+    expect(markup).toContain("Manual Add");
+  });
+
+  it("flattens listing updates for the existing PATCH endpoint", async () => {
+    const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
+    const fetchMock = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      calls.push([input, init]);
+
+      return {
+        json: async () => ({
+          listing: {
+            availabilitySummary: "Available Jun 30 to Sep 12",
+            bathroomType: "unknown",
+            bedroomCount: 0,
+            bedroomLabel: "Studio",
+            createdAt: "2026-04-16T00:00:00.000Z",
+            earliestMoveIn: null,
+            earliestMoveOut: null,
+            furnished: "unknown",
+            id: "listing-test",
+            kitchen: "unknown",
+            latestMoveIn: null,
+            latestMoveOut: null,
+            monthToMonth: false,
+            monthlyRent: 3200,
+            nextAction: null,
+            scoreBreakdown: null,
+            source: "leasebreak",
+            sourceUrl: "https://www.leasebreak.com/test",
+            status: "contacted",
+            stayType: "entire_apartment",
+            title: "Test listing",
+            updatedAt: "2026-04-16T00:00:00.000Z",
+            userNotes: "Messaged landlord",
+            washer: "unknown"
+          }
+        }),
+        ok: true,
+        status: 200,
+        statusText: "OK"
+      } as Response;
+    }) as typeof fetch;
+    const client = new PamilaApiClient({
+      baseUrl: "http://localhost:7410",
+      fetchImpl: fetchMock,
+      token: "local-token"
+    });
+
+    await client.updateListing("listing-test", {
+      dateWindow: {
+        availabilitySummary: "Available Jun 30 to Sep 12"
+      },
+      status: "contacted",
+      userNotes: "Messaged landlord"
+    });
+
+    const [, options] = calls[0]!;
+    const body = JSON.parse(String(options?.body));
+    expect(body).toMatchObject({
+      availabilitySummary: "Available Jun 30 to Sep 12",
+      status: "contacted",
+      userNotes: "Messaged landlord"
+    });
+    expect(body.dateWindow).toBeUndefined();
+  });
+
+  it("sends manual location and commute updates to the API contract routes", async () => {
+    const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
+    const apiListing = {
+      availabilitySummary: null,
+      bathroomType: "unknown",
+      bedroomCount: 0,
+      bedroomLabel: "Studio",
+      createdAt: "2026-04-16T00:00:00.000Z",
+      earliestMoveIn: null,
+      earliestMoveOut: null,
+      furnished: "unknown",
+      id: "listing-test",
+      kitchen: "unknown",
+      latestMoveIn: null,
+      latestMoveOut: null,
+      monthToMonth: false,
+      monthlyRent: 3200,
+      nextAction: null,
+      scoreBreakdown: null,
+      source: "leasebreak",
+      sourceUrl: "https://www.leasebreak.com/test",
+      status: "needs_cleanup",
+      stayType: "entire_apartment",
+      title: "Test listing",
+      updatedAt: "2026-04-16T00:00:00.000Z",
+      userNotes: null,
+      washer: "unknown"
+    };
+    const fetchMock = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      calls.push([input, init]);
+
+      return {
+        json: async () => ({ listing: apiListing }),
+        ok: true,
+        status: 200,
+        statusText: "OK"
+      } as Response;
+    }) as typeof fetch;
+    const client = new PamilaApiClient({
+      baseUrl: "http://localhost:7410",
+      fetchImpl: fetchMock,
+      token: "local-token"
+    });
+    const location = locationDraftToLocation({
+      address: "",
+      confidenceLabel: "neighborhood",
+      crossStreets: "",
+      neighborhood: "Chelsea",
+      sourceLabel: "user_confirmed"
+    });
+    const commute = commuteDraftToSummary({
+      hasBusHeavyRoute: false,
+      lastCheckedAt: "",
+      lineNames: "F, M",
+      routeSummary: "F/M to 23 St",
+      totalMinutes: "18",
+      transferCount: "0",
+      walkMinutes: "5"
+    });
+
+    await client.updateListingLocation("listing-test", location);
+    await client.updateListingCommute("listing-test", commute, "2026-04-16T12:00:00.000Z");
+
+    expect(calls[0]?.[0]).toBe("http://localhost:7410/api/listings/listing-test/location");
+    expect(JSON.parse(String(calls[0]?.[1]?.body))).toMatchObject({
+      label: "Chelsea",
+      neighborhood: "Chelsea"
+    });
+    expect(calls[1]?.[0]).toBe("http://localhost:7410/api/listings/listing-test/commute");
+    expect(JSON.parse(String(calls[1]?.[1]?.body))).toMatchObject({
+      calculatedAt: "2026-04-16T12:00:00.000Z",
+      lineNames: ["F", "M"],
+      totalMinutes: 18
+    });
+  });
+
+  it("sends settings updates including Panic Mode and AI capture toggles", async () => {
+    const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
+    const fetchMock = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      calls.push([input, init]);
+
+      return {
+        json: async () => ({
+          settings: {
+            ...initialDashboardSnapshot.settings,
+            aiOnCaptureEnabled: true,
+            panicModeEnabled: true
+          }
+        }),
+        ok: true,
+        status: 200,
+        statusText: "OK"
+      } as Response;
+    }) as typeof fetch;
+    const client = new PamilaApiClient({
+      baseUrl: "http://localhost:7410",
+      fetchImpl: fetchMock,
+      token: "local-token"
+    });
+
+    await client.updateSettings({
+      ...initialDashboardSnapshot.settings,
+      aiOnCaptureEnabled: true,
+      panicModeEnabled: true
+    });
+
+    const body = JSON.parse(String(calls[0]?.[1]?.body));
+    expect(body.aiOnCaptureEnabled).toBe(true);
+    expect(body.panicModeEnabled).toBe(true);
+  });
+
+  it("builds manual location and commute values without scoring in React", () => {
+    const location = locationDraftToLocation({
+      address: "",
+      confidenceLabel: "cross_street",
+      crossStreets: "W 23rd St and 6th Ave",
+      neighborhood: "Flatiron",
+      sourceLabel: "user_confirmed"
+    });
+    const commute = commuteDraftToSummary({
+      hasBusHeavyRoute: false,
+      lastCheckedAt: "2026-04-16T12:00:00.000Z",
+      lineNames: "N, R, W",
+      routeSummary: "N/R/W to 23 St",
+      totalMinutes: "18",
+      transferCount: "0",
+      walkMinutes: "5"
+    });
+
+    expect(location?.source).toBe("cross_streets");
+    expect(location?.confidence).toBe("high");
+    expect(commute?.confidence).toBe("manual");
+    expect(commute?.lineNames).toEqual(["N", "R", "W"]);
+  });
+
+  it("surfaces missing finalist blockers for cleanup", () => {
+    const listing = createManualListing(emptyManualListingDraft, 0);
+
+    expect(getMissingFinalistBlockers(listing)).toEqual([
+      "price",
+      "dates",
+      "location"
+    ]);
+  });
+
+  it("applies capture suggestions to local listing state", () => {
+    const listing = mockDashboardListings[1]!;
+    const suggestion = listing.captureReview?.suggestions.find(
+      (candidate) => candidate.field === "location"
+    );
+
+    expect(suggestion).toBeDefined();
+
+    const updated = applyCaptureSuggestionToListing(listing, suggestion!);
+
+    expect(updated.location?.neighborhood).toBe("Long Island City");
+    expect(updated.locationSourceLabel).toBe("airbnb_approximate");
+  });
+
+  it("creates local CSV and JSON exports for API-offline fallback", () => {
+    const csv = createLocalCsvExport(mockDashboardListings.slice(0, 1));
+    const backup = createLocalBackupExport(initialDashboardSnapshot);
+
+    expect(csv).toContain("sourceUrl");
+    expect(csv).toContain("Bright Chelsea studio");
+    expect(JSON.parse(backup).settings.maxMonthlyRent).toBe(3600);
+  });
+
+  it("hydrates commute editor drafts from listings", () => {
+    const draft = listingToCommuteDraft(mockDashboardListings[0]!);
+
+    expect(draft.totalMinutes).toBe("18");
+    expect(draft.lineNames).toContain("N");
   });
 });

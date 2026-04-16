@@ -5,15 +5,17 @@ import {
   type ListingDateWindow,
   type ListingLocation,
   type ScoreBreakdown,
-  type SearchSettings
 } from "@pamila/core";
 
 import type {
+  CaptureReview,
   DashboardListing,
   DashboardSnapshot,
+  DashboardSettings,
   ListingsCsvExport,
   ListingsJsonExport,
-  ManualListingDraft
+  ManualListingDraft,
+  LocationSourceLabel
 } from "./dashboardTypes";
 
 export interface PamilaApiClientOptions {
@@ -28,6 +30,12 @@ export interface RecalculateScoresResult {
 }
 
 export interface CreateListingRequest extends ManualListingDraft {}
+
+export type ListingUpdateRequest = Partial<
+  Omit<DashboardListing, "dateWindow" | "score" | "captureReview">
+> & {
+  dateWindow?: Partial<ListingDateWindow>;
+};
 
 interface ApiListingRecord {
   id: string;
@@ -54,6 +62,12 @@ interface ApiListingRecord {
   createdAt: string;
   updatedAt: string;
   scoreBreakdown: ScoreBreakdown | null;
+  location?: ListingLocation | null;
+  locationSourceLabel?: LocationSourceLabel | null;
+  commute?: CommuteSummary | null;
+  commuteEstimate?: CommuteSummary | null;
+  lastCommuteCheckedAt?: string | null;
+  captureReview?: CaptureReview | null;
 }
 
 export class PamilaApiClient {
@@ -67,13 +81,13 @@ export class PamilaApiClient {
     this.token = options.token ?? null;
   }
 
-  async getSettings(): Promise<SearchSettings> {
-    const response = await this.request<{ settings: SearchSettings }>("/api/settings");
+  async getSettings(): Promise<DashboardSettings> {
+    const response = await this.request<{ settings: DashboardSettings }>("/api/settings");
     return response.settings;
   }
 
-  async updateSettings(settings: SearchSettings): Promise<SearchSettings> {
-    const response = await this.request<{ settings: SearchSettings }>("/api/settings", {
+  async updateSettings(settings: DashboardSettings): Promise<DashboardSettings> {
+    const response = await this.request<{ settings: DashboardSettings }>("/api/settings", {
       body: JSON.stringify(settings),
       method: "PUT"
     });
@@ -95,13 +109,50 @@ export class PamilaApiClient {
 
   async updateListing(
     id: string,
-    patch: Partial<DashboardListing>
+    patch: ListingUpdateRequest
   ): Promise<DashboardListing> {
     const response = await this.request<{ listing: ApiListingRecord }>(`/api/listings/${encodeURIComponent(id)}`, {
-      body: JSON.stringify(patch),
+      body: JSON.stringify(toUpdateListingBody(patch)),
       method: "PATCH"
     });
     return mapApiListing(response.listing);
+  }
+
+  async updateListingLocation(
+    id: string,
+    location: ListingLocation | null,
+    sourceLabel?: LocationSourceLabel | null
+  ): Promise<DashboardListing> {
+    const response = await this.request<{ listing: ApiListingRecord }>(
+      `/api/listings/${encodeURIComponent(id)}/location`,
+      {
+        body: JSON.stringify(location),
+        method: "PUT"
+      }
+    );
+    return mapApiListing(response.listing);
+  }
+
+  async updateListingCommute(
+    id: string,
+    commute: CommuteSummary | null,
+    checkedAt: string
+  ): Promise<DashboardListing> {
+    const response = await this.request<{ listing: ApiListingRecord }>(
+      `/api/listings/${encodeURIComponent(id)}/commute`,
+      {
+        body: JSON.stringify(commute ? { ...commute, calculatedAt: checkedAt } : { calculatedAt: checkedAt }),
+        method: "PUT"
+      }
+    );
+    return mapApiListing(response.listing);
+  }
+
+  async getListingCaptures(id: string): Promise<CaptureReview[]> {
+    const response = await this.request<{ captures: CaptureReview[] }>(
+      `/api/listings/${encodeURIComponent(id)}/captures`
+    );
+    return response.captures;
   }
 
   async deleteListing(id: string): Promise<void> {
@@ -152,7 +203,7 @@ export class PamilaApiClient {
 
   async exportBackupJson(): Promise<ListingsJsonExport> {
     const response = await this.request<{
-      settings: SearchSettings;
+      settings: DashboardSettings;
       listings: ApiListingRecord[];
       captures: CapturePayload[];
     }>("/api/exports/backup.json");
@@ -232,6 +283,29 @@ function toCreateListingBody(draft: ManualListingDraft) {
   };
 }
 
+function toUpdateListingBody(patch: ListingUpdateRequest) {
+  const body: Record<string, unknown> = { ...patch };
+
+  delete body.dateWindow;
+  delete body.score;
+  delete body.location;
+  delete body.commute;
+  delete body.captureReview;
+  delete body.locationSourceLabel;
+  delete body.lastCommuteCheckedAt;
+
+  if (patch.dateWindow) {
+    body.availabilitySummary = patch.dateWindow.availabilitySummary;
+    body.earliestMoveIn = patch.dateWindow.earliestMoveIn;
+    body.latestMoveIn = patch.dateWindow.latestMoveIn;
+    body.earliestMoveOut = patch.dateWindow.earliestMoveOut;
+    body.latestMoveOut = patch.dateWindow.latestMoveOut;
+    body.monthToMonth = patch.dateWindow.monthToMonth;
+  }
+
+  return body;
+}
+
 function mapApiListing(listing: ApiListingRecord): DashboardListing {
   const dateWindow: ListingDateWindow = {
     availabilitySummary: listing.availabilitySummary,
@@ -246,13 +320,16 @@ function mapApiListing(listing: ApiListingRecord): DashboardListing {
     bathroomType: listing.bathroomType,
     bedroomCount: listing.bedroomCount,
     bedroomLabel: listing.bedroomLabel,
-    commute: null satisfies CommuteSummary | null,
+    captureReview: listing.captureReview ?? null,
+    commute: listing.commute ?? listing.commuteEstimate ?? (null satisfies CommuteSummary | null),
     createdAt: listing.createdAt,
     dateWindow,
     furnished: listing.furnished,
     id: listing.id,
     kitchen: listing.kitchen,
-    location: null satisfies ListingLocation | null,
+    lastCommuteCheckedAt: listing.lastCommuteCheckedAt ?? null,
+    location: listing.location ?? (null satisfies ListingLocation | null),
+    locationSourceLabel: listing.locationSourceLabel ?? null,
     monthlyRent: listing.monthlyRent,
     nextAction: listing.nextAction ?? "Review listing details and cleanup actions.",
     score: listing.scoreBreakdown ?? pendingApiScore(),

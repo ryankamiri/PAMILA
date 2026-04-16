@@ -121,6 +121,58 @@ describe("PamilaDatabase", () => {
     expect(backup.captures).toEqual([]);
     expect(backup.settings.officeName).toBe("Ramp NYC");
   });
+
+  it("stores location, manual commute, AI analysis, and restores backup payloads", () => {
+    const db = createInMemoryPamilaDb();
+    const listing = db.createListing({
+      monthlyRent: 3200,
+      source: "airbnb",
+      sourceUrl: "https://www.airbnb.com/rooms/restore-me",
+      title: "Restore me"
+    });
+
+    db.upsertListingLocation(listing.id, {
+      confidence: "high",
+      geographyCategory: "manhattan",
+      isUserConfirmed: true,
+      label: "Chelsea",
+      neighborhood: "Chelsea",
+      source: "neighborhood"
+    });
+    db.upsertManualCommuteEstimate(listing.id, {
+      hasBusHeavyRoute: false,
+      lineNames: ["F", "M"],
+      routeSummary: "F/M to 23 St",
+      totalMinutes: 18,
+      transferCount: 0,
+      walkMinutes: 5
+    });
+    db.saveAiAnalysis({
+      analysis: { hostQuestions: ["Does July 1 work?"] },
+      inputHash: "capture-hash",
+      listingId: listing.id,
+      model: "gpt-5"
+    });
+
+    const backup = db.createBackup();
+    const restored = createInMemoryPamilaDb();
+    const result = restored.restoreBackup(backup);
+
+    const restoredLocation = restored.getCurrentLocation(listing.id);
+    const restoredCommute = restored.getCurrentCommuteEstimate(listing.id);
+    const restoredAi = restored.getAiAnalysisByInputHash("capture-hash");
+
+    db.close();
+    restored.close();
+
+    expect(result.listingsRestored).toBe(1);
+    expect(result.locationsRestored).toBe(1);
+    expect(result.commuteEstimatesRestored).toBe(1);
+    expect(result.aiAnalysesRestored).toBe(1);
+    expect(restoredLocation?.geographyCategory).toBe("manhattan");
+    expect(restoredCommute?.lineNames).toEqual(["F", "M"]);
+    expect(restoredAi?.analysis.hostQuestions).toEqual(["Does July 1 work?"]);
+  });
 });
 
 describe("canonicalizeUrlForDb", () => {

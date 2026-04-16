@@ -134,6 +134,7 @@ export const mockDashboardListings: DashboardListing[] = [
     id: "listing-lic-1br",
     kitchen: "yes",
     location: location("Court Sq", "Long Island City", "lic_astoria", "medium", "airbnb_approx_pin"),
+    locationSourceLabel: "airbnb_approximate",
     monthlyRent: 3320,
     nextAction: "Ask whether the stay can be held through September 12.",
     score: score(
@@ -150,7 +151,43 @@ export const mockDashboardListings: DashboardListing[] = [
     title: "LIC furnished 1BR with skyline view",
     updatedAt: "2026-04-15T15:30:00.000Z",
     userNotes: "Airbnb pin is approximate.",
-    washer: "in_building"
+    washer: "in_building",
+    captureReview: {
+      captureId: "capture-lic-airbnb",
+      capturedTitle: "LIC furnished 1BR with skyline view - Airbnb",
+      pageExcerpt:
+        "Entire rental unit in Long Island City. Furnished one bedroom, washer in building, month-to-month from July. Host says dates are flexible.",
+      source: "airbnb",
+      visibleFields: {
+        price: "$3,320 month",
+        roomType: "Entire rental unit",
+        location: "Long Island City"
+      },
+      suggestions: [
+        {
+          confidence: "high",
+          field: "availabilitySummary",
+          id: "suggest-lic-dates",
+          label: "Use captured date summary: month-to-month from July",
+          source: "captured_field",
+          value: "Month-to-month from July; confirm September 12 end date"
+        },
+        {
+          confidence: "medium",
+          field: "location",
+          id: "suggest-lic-location",
+          label: "Set approximate Airbnb location to Long Island City",
+          source: "heuristic",
+          value: {
+            address: "",
+            confidenceLabel: "approximate",
+            crossStreets: "Court Sq",
+            neighborhood: "Long Island City",
+            sourceLabel: "airbnb_approximate"
+          }
+        }
+      ]
+    }
   },
   {
     bathroomType: "shared",
@@ -206,6 +243,7 @@ export const mockDashboardListings: DashboardListing[] = [
     id: "listing-nomad-1br",
     kitchen: "yes",
     location: location("W 29th St and Broadway", "NoMad", "manhattan", "high", "cross_streets"),
+    locationSourceLabel: "leasebreak",
     monthlyRent: 3580,
     nextAction: "Ask landlord whether a July 1 start is realistic despite immediate move-in preference.",
     score: score(
@@ -225,7 +263,29 @@ export const mockDashboardListings: DashboardListing[] = [
     title: "NoMad 1BR with immediate move-in preference",
     updatedAt: "2026-04-13T17:45:00.000Z",
     userNotes: "Could be elite if landlord accepts July 1.",
-    washer: "in_building"
+    washer: "in_building",
+    captureReview: {
+      captureId: "capture-nomad-leasebreak",
+      capturedTitle: "NoMad 1BR with immediate move-in preference",
+      pageExcerpt:
+        "Earliest move-in immediate. Latest move-in July 3. Earliest move-out August 31. Latest move-out September 12. Furnished status not listed.",
+      source: "leasebreak",
+      visibleFields: {
+        earliestMoveIn: "Immediate",
+        latestMoveIn: "July 3",
+        latestMoveOut: "September 12"
+      },
+      suggestions: [
+        {
+          confidence: "high",
+          field: "userNotes",
+          id: "suggest-nomad-question",
+          label: "Add host question about July 1 start flexibility",
+          source: "heuristic",
+          value: "Ask whether a July 1 start is acceptable despite the immediate move-in preference."
+        }
+      ]
+    }
   },
   {
     bathroomType: "private",
@@ -271,7 +331,10 @@ export const mockDashboardListings: DashboardListing[] = [
 
 export const initialDashboardSnapshot = {
   listings: mockDashboardListings,
-  settings: DEFAULT_SEARCH_SETTINGS
+  settings: {
+    ...DEFAULT_SEARCH_SETTINGS,
+    aiOnCaptureEnabled: false
+  }
 };
 
 export const emptyManualListingDraft: ManualListingDraft = {
