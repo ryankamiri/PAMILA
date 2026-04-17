@@ -168,6 +168,8 @@ export const listingToLocationDraft = (listing: DashboardListing): ManualLocatio
     ? confidenceLabelFromLocation(listing.location)
     : "unknown",
   crossStreets: listing.location?.crossStreets ?? "",
+  lat: listing.location?.lat === null || listing.location?.lat === undefined ? "" : String(listing.location.lat),
+  lng: listing.location?.lng === null || listing.location?.lng === undefined ? "" : String(listing.location.lng),
   neighborhood: listing.location?.neighborhood ?? "",
   sourceLabel: listing.locationSourceLabel ?? sourceLabelFromLocation(listing.location, listing.source)
 });
@@ -178,9 +180,11 @@ export const locationDraftToLocation = (
   const address = draft.address.trim();
   const crossStreets = draft.crossStreets.trim();
   const neighborhood = draft.neighborhood.trim();
+  const lat = parseCoordinateDraft(draft.lat);
+  const lng = parseCoordinateDraft(draft.lng);
   const label = address || crossStreets || neighborhood;
 
-  if (!label && draft.confidenceLabel === "unknown") {
+  if (!label && lat === null && lng === null && draft.confidenceLabel === "unknown") {
     return null;
   }
 
@@ -191,8 +195,8 @@ export const locationDraftToLocation = (
     geographyCategory: geographyFromText(`${address} ${crossStreets} ${neighborhood}`),
     isUserConfirmed: draft.sourceLabel === "user_confirmed",
     label: label || "Unknown location",
-    lat: null,
-    lng: null,
+    lat,
+    lng,
     neighborhood: neighborhood || null,
     source: coreSourceFromLabels(draft.sourceLabel, draft.confidenceLabel)
   };
@@ -479,6 +483,11 @@ export const createManualListing = (
 
 function parseNullableNumber(value: string): number | null {
   const parsed = Number.parseFloat(value.replace(/[^\d.]/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseCoordinateDraft(value: string): number | null {
+  const parsed = Number.parseFloat(value.trim());
   return Number.isFinite(parsed) ? parsed : null;
 }
 

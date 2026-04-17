@@ -10,6 +10,10 @@
     "build:packages": "pnpm -r --sort --filter @pamila/core --filter @pamila/db --filter @pamila/ui run build",
     "build": "pnpm -r --sort run build",
     "typecheck": "pnpm run build:packages && pnpm -r --sort run typecheck",
-    "test": "pnpm -r --sort run test"
+    "test": "pnpm -r --sort run test",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
   }
 }

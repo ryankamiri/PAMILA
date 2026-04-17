@@ -81,6 +81,8 @@ export interface ManualLocationDraft {
   address: string;
   crossStreets: string;
   neighborhood: string;
+  lat: string;
+  lng: string;
   confidenceLabel: LocationConfidenceLabel;
   sourceLabel: LocationSourceLabel;
 }
@@ -135,4 +137,19 @@ export interface ListingsJsonExport {
   settings: DashboardSettings;
   listings: DashboardListing[];
   captures: CapturePayload[];
+}
+
+export interface GeocodeListingResult {
+  status: "ok" | "missing_query" | "geocoder_unavailable" | "no_result";
+  location: ListingLocation | null;
+  listing: DashboardListing | null;
+  warnings: string[];
+}
+
+export interface CalculateCommuteResult {
+  status: "ok" | "missing_location" | "otp_unavailable" | "otp_error" | "no_route";
+  commute: CommuteSummary | null;
+  listing: DashboardListing | null;
+  warnings: string[];
+  externalDirectionsUrl: string | null;
 }

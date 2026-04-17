@@ -20,6 +20,8 @@ import {
   LISTING_STATUSES,
   STAY_TYPES,
   type BedroomFilter,
+  type CommuteSummary,
+  type ListingLocation,
   type ListingSource,
   type ListingStatus,
   type StayType
@@ -32,13 +34,16 @@ import {
 } from "./captureAnalysis.js";
 import { loadApiConfig } from "./config.js";
 import { calculateListingScore } from "./scoring.js";
+import { requestOtpCommute } from "./services/otpAdapter.js";
 
 export interface BuildAppOptions {
   db?: PamilaDatabase;
   databaseUrl?: string;
   fetchImpl?: typeof fetch;
+  geocoderUrl?: string;
   openAiApiKey?: string | null;
   openAiModel?: string;
+  otpUrl?: string;
   token?: string;
 }
 
@@ -48,6 +53,8 @@ export function buildApp(options: BuildAppOptions = {}) {
   const localToken = options.token ?? config.localToken;
   const openAiApiKey = "openAiApiKey" in options ? options.openAiApiKey : config.openAiApiKey;
   const openAiModel = options.openAiModel ?? config.openAiModel;
+  const geocoderUrl = options.geocoderUrl ?? config.geocoderUrl;
+  const otpUrl = options.otpUrl ?? config.otpUrl;
   const ownsDb = !options.db;
 
   const app = Fastify({
@@ -55,7 +62,7 @@ export function buildApp(options: BuildAppOptions = {}) {
   });
 
   app.addHook("onRequest", async (request, reply) => {
-    reply.header("Access-Control-Allow-Origin", config.webOrigin);
+    reply.header("Access-Control-Allow-Origin", corsOriginForRequest(request.headers.origin, config.webOrigin));
     reply.header("Access-Control-Allow-Headers", "Content-Type, X-PAMILA-Token");
     reply.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 
@@ -156,6 +163,59 @@ export function buildApp(options: BuildAppOptions = {}) {
     return reply.send({ listing, location });
   });
 
+  app.post("/api/listings/:id/location/geocode", async (request, reply) => {
+    const id = getRouteId(request.params);
+    const listing = db.getListing(id);
+    if (!listing) {
+      return notFound(reply, "Listing not found.");
+    }
+
+    const location = db.getCurrentLocation(id);
+    if (!location) {
+      return reply.send({
+        location: null,
+        listing: listingForResponse(db, listing),
+        status: "missing_query",
+        warnings: ["Add an address, cross streets, or neighborhood before geocoding."]
+      } satisfies GeocodeListingResponse);
+    }
+
+    const geocoded = await geocodeListingLocation(location, {
+      fetchImpl: options.fetchImpl,
+      geocoderUrl
+    });
+
+    if (geocoded.status !== "ok") {
+      return reply.send({
+        location,
+        listing: listingForResponse(db, listing),
+        status: geocoded.status,
+        warnings: geocoded.warnings
+      } satisfies GeocodeListingResponse);
+    }
+
+    const updatedLocation = db.upsertListingLocation(id, {
+      address: location.address,
+      confidence: location.confidence === "low" ? "medium" : location.confidence,
+      crossStreets: location.crossStreets,
+      geographyCategory: location.geographyCategory,
+      isUserConfirmed: location.isUserConfirmed,
+      label: location.label,
+      lat: geocoded.lat,
+      lng: geocoded.lng,
+      neighborhood: location.neighborhood,
+      source: location.source
+    });
+    const refreshedListing = recalculateListing(db, id);
+
+    return reply.send({
+      location: updatedLocation,
+      listing: refreshedListing,
+      status: "ok",
+      warnings: geocoded.warnings
+    } satisfies GeocodeListingResponse);
+  });
+
   app.get("/api/listings/:id/commute", async (request, reply) => {
     const id = getRouteId(request.params);
     if (!db.getListing(id)) {
@@ -181,6 +241,62 @@ export function buildApp(options: BuildAppOptions = {}) {
 
   app.put("/api/listings/:id/commute", updateCommuteHandler);
   app.put("/api/listings/:id/commute/manual", updateCommuteHandler);
+
+  app.post("/api/listings/:id/commute/calculate", async (request, reply) => {
+    const id = getRouteId(request.params);
+    const listing = db.getListing(id);
+    if (!listing) {
+      return notFound(reply, "Listing not found.");
+    }
+
+    const location = db.getCurrentLocation(id);
+    const existingCommute = db.getCurrentCommuteEstimate(id);
+    if (!hasCoordinates(location)) {
+      return reply.send({
+        commute: existingCommute,
+        externalDirectionsUrl: null,
+        listing: listingForResponse(db, listing),
+        status: "missing_location",
+        warnings: ["Add coordinates with geocoding or manual latitude/longitude before OTP routing."]
+      } satisfies CalculateCommuteResponse);
+    }
+
+    const settings = db.getSettings();
+    const officeDestination =
+      settings.officeLat !== null && settings.officeLng !== null
+        ? { lat: settings.officeLat, lon: settings.officeLng }
+        : null;
+    const otpResult = await requestOtpCommute(location, {
+      endpoint: otpUrl,
+      ...(options.fetchImpl ? { fetcher: options.fetchImpl } : {}),
+      ...(officeDestination ? { destination: officeDestination } : {})
+    });
+
+    if (otpResult.status !== "ok") {
+      return reply.send({
+        commute: existingCommute,
+        externalDirectionsUrl: otpResult.externalDirectionsUrl,
+        listing: listingForResponse(db, listing),
+        status: otpResult.status === "low_confidence_origin" ? "missing_location" : otpResult.status,
+        warnings: [otpResult.message, ...otpResult.warnings]
+      } satisfies CalculateCommuteResponse);
+    }
+
+    const commute = db.upsertManualCommuteEstimate(id, {
+      ...otpResult.summary,
+      calculatedAt: new Date().toISOString(),
+      confidence: "estimated"
+    });
+    const refreshedListing = recalculateListing(db, id);
+
+    return reply.send({
+      commute,
+      externalDirectionsUrl: otpResult.externalDirectionsUrl,
+      listing: refreshedListing,
+      status: "ok",
+      warnings: otpResult.warnings
+    } satisfies CalculateCommuteResponse);
+  });
 
   app.get("/api/listings/:id/captures", async (request, reply) => {
     const id = getRouteId(request.params);
@@ -367,6 +483,164 @@ function listingForResponse(db: PamilaDatabase, listing: ListingWithScore) {
     lastCommuteCheckedAt: commute?.calculatedAt ?? null,
     location: db.getCurrentLocation(listing.id)
   };
+}
+
+function corsOriginForRequest(origin: string | undefined, configuredOrigin: string) {
+  if (!origin) {
+    return configuredOrigin;
+  }
+
+  const allowedOrigins = new Set([
+    configuredOrigin,
+    configuredOrigin.replace("localhost", "127.0.0.1"),
+    configuredOrigin.replace("127.0.0.1", "localhost")
+  ]);
+
+  return allowedOrigins.has(origin) ? origin : configuredOrigin;
+}
+
+interface GeocodeListingResponse {
+  status: "ok" | "missing_query" | "geocoder_unavailable" | "no_result";
+  location: ListingLocation | null;
+  listing: unknown;
+  warnings: string[];
+}
+
+interface CalculateCommuteResponse {
+  status: "ok" | "missing_location" | "otp_unavailable" | "otp_error" | "no_route";
+  commute: CommuteSummary | null;
+  listing: unknown;
+  warnings: string[];
+  externalDirectionsUrl: string | null;
+}
+
+type GeocodeLocationResult =
+  | {
+      status: "ok";
+      lat: number;
+      lng: number;
+      warnings: string[];
+    }
+  | {
+      status: "missing_query" | "geocoder_unavailable" | "no_result";
+      warnings: string[];
+    };
+
+async function geocodeListingLocation(
+  location: ListingLocation,
+  options: {
+    fetchImpl?: typeof fetch | undefined;
+    geocoderUrl: string;
+  }
+): Promise<GeocodeLocationResult> {
+  if (hasCoordinates(location)) {
+    return {
+      lat: location.lat,
+      lng: location.lng,
+      status: "ok",
+      warnings: ["Location already has coordinates; using saved coordinates."]
+    };
+  }
+
+  const query = buildGeocodeQuery(location);
+  if (!query) {
+    return {
+      status: "missing_query",
+      warnings: ["Add an address, cross streets, or neighborhood before geocoding."]
+    };
+  }
+
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (!fetchImpl) {
+    return {
+      status: "geocoder_unavailable",
+      warnings: ["No fetch implementation is available for geocoding."]
+    };
+  }
+
+  const url = new URL(options.geocoderUrl);
+  url.searchParams.set("format", "jsonv2");
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("q", query);
+
+  try {
+    const response = await fetchImpl(url, {
+      headers: {
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "PAMILA local apartment search (personal use)"
+      }
+    });
+
+    if (!response.ok) {
+      return {
+        status: "geocoder_unavailable",
+        warnings: [`Geocoder returned HTTP ${response.status}.`]
+      };
+    }
+
+    const payload = await response.json();
+    const first = Array.isArray(payload) ? payload[0] : null;
+    if (!first || typeof first !== "object") {
+      return {
+        status: "no_result",
+        warnings: [`No geocoding result found for "${query}".`]
+      };
+    }
+
+    const result = first as Record<string, unknown>;
+    const lat = parseCoordinate(result.lat);
+    const lng = parseCoordinate(result.lon);
+    if (lat === null || lng === null || !isFiniteCoordinatePair(lat, lng)) {
+      return {
+        status: "no_result",
+        warnings: [`Geocoder result for "${query}" did not include usable coordinates.`]
+      };
+    }
+
+    return {
+      lat,
+      lng,
+      status: "ok",
+      warnings: []
+    };
+  } catch (error) {
+    return {
+      status: "geocoder_unavailable",
+      warnings: [error instanceof Error ? error.message : "Geocoder request failed."]
+    };
+  }
+}
+
+function buildGeocodeQuery(location: ListingLocation) {
+  const core = [location.address, location.crossStreets, location.neighborhood, location.label]
+    .map((value) => value?.trim())
+    .find((value): value is string => Boolean(value));
+
+  if (!core) {
+    return "";
+  }
+
+  return /new york|nyc|brooklyn|queens/i.test(core) ? core : `${core}, New York, NY`;
+}
+
+function parseCoordinate(value: unknown): number | null {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function hasCoordinates(
+  location: ListingLocation | null
+): location is ListingLocation & { lat: number; lng: number } {
+  return location !== null && isFiniteCoordinatePair(location.lat, location.lng);
+}
+
+function isFiniteCoordinatePair(lat: number | null, lng: number | null): boolean {
+  return (
+    typeof lat === "number" &&
+    typeof lng === "number" &&
+    Number.isFinite(lat) &&
+    Number.isFinite(lng)
+  );
 }
 
 interface CaptureAnalysisRuntimeOptions {

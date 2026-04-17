@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { APP_NAME } from "./appConfig";
-import { App } from "./App";
+import { App, MapCommuteView } from "./App";
 import { PamilaApiClient } from "./apiClient";
 import {
   applyCaptureSuggestionToListing,
@@ -124,6 +124,23 @@ describe("web dashboard lane", () => {
     expect(markup).toContain("Manual Add");
   });
 
+  it("renders the OSM map shell with Ramp and coordinate queues", () => {
+    const markup = renderToStaticMarkup(
+      createElement(MapCommuteView, {
+        listings: mockDashboardListings,
+        onCalculateCommute: () => undefined,
+        onGeocodeLocation: () => undefined,
+        onSelect: () => undefined,
+        settings: initialDashboardSnapshot.settings
+      })
+    );
+
+    expect(markup).toContain("data-testid=\"pamila-osm-map\"");
+    expect(markup).toContain("OpenStreetMap");
+    expect(markup).toContain("Need coords");
+    expect(markup).toContain("Geocode");
+  });
+
   it("flattens listing updates for the existing PATCH endpoint", async () => {
     const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
     const fetchMock = (async (input: URL | RequestInfo, init?: RequestInit) => {
@@ -234,6 +251,8 @@ describe("web dashboard lane", () => {
       address: "",
       confidenceLabel: "neighborhood",
       crossStreets: "",
+      lat: "",
+      lng: "",
       neighborhood: "Chelsea",
       sourceLabel: "user_confirmed"
     });
@@ -261,6 +280,66 @@ describe("web dashboard lane", () => {
       lineNames: ["F", "M"],
       totalMinutes: 18
     });
+  });
+
+  it("calls geocode and OTP calculate API routes", async () => {
+    const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
+    const apiListing = {
+      availabilitySummary: null,
+      bathroomType: "unknown",
+      bedroomCount: 0,
+      bedroomLabel: "Studio",
+      createdAt: "2026-04-16T00:00:00.000Z",
+      earliestMoveIn: null,
+      earliestMoveOut: null,
+      furnished: "unknown",
+      id: "listing-test",
+      kitchen: "unknown",
+      latestMoveIn: null,
+      latestMoveOut: null,
+      monthToMonth: false,
+      monthlyRent: 3200,
+      nextAction: null,
+      scoreBreakdown: null,
+      source: "leasebreak",
+      sourceUrl: "https://www.leasebreak.com/test",
+      status: "needs_cleanup",
+      stayType: "entire_apartment",
+      title: "Test listing",
+      updatedAt: "2026-04-16T00:00:00.000Z",
+      userNotes: null,
+      washer: "unknown"
+    };
+    const fetchMock = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      calls.push([input, init]);
+
+      return {
+        json: async () => ({
+          commute: null,
+          externalDirectionsUrl: null,
+          listing: apiListing,
+          location: null,
+          status: "ok",
+          warnings: []
+        }),
+        ok: true,
+        status: 200,
+        statusText: "OK"
+      } as Response;
+    }) as typeof fetch;
+    const client = new PamilaApiClient({
+      baseUrl: "http://localhost:7410",
+      fetchImpl: fetchMock,
+      token: "local-token"
+    });
+
+    await client.geocodeListingLocation("listing-test");
+    await client.calculateListingCommute("listing-test");
+
+    expect(calls[0]?.[0]).toBe("http://localhost:7410/api/listings/listing-test/location/geocode");
+    expect(calls[0]?.[1]?.method).toBe("POST");
+    expect(calls[1]?.[0]).toBe("http://localhost:7410/api/listings/listing-test/commute/calculate");
+    expect(calls[1]?.[1]?.method).toBe("POST");
   });
 
   it("sends settings updates including Panic Mode and AI capture toggles", async () => {
@@ -303,6 +382,8 @@ describe("web dashboard lane", () => {
       address: "",
       confidenceLabel: "cross_street",
       crossStreets: "W 23rd St and 6th Ave",
+      lat: "40.7421",
+      lng: "-73.9916",
       neighborhood: "Flatiron",
       sourceLabel: "user_confirmed"
     });
@@ -318,6 +399,8 @@ describe("web dashboard lane", () => {
 
     expect(location?.source).toBe("cross_streets");
     expect(location?.confidence).toBe("high");
+    expect(location?.lat).toBe(40.7421);
+    expect(location?.lng).toBe(-73.9916);
     expect(commute?.confidence).toBe("manual");
     expect(commute?.lineNames).toEqual(["N", "R", "W"]);
   });

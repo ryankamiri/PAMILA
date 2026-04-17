@@ -2,6 +2,9 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+.pnpm-store/
+test-results/
+playwright-report/
 
 .env
 .env.*

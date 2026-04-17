@@ -299,6 +299,255 @@ describe("api", () => {
     expect(captures.json().captures).toHaveLength(2);
   });
 
+  it("geocodes a saved listing location when triggered", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([{ lat: "40.7421", lon: "-73.9916" }]), { status: 200 })
+    );
+    const app = buildApp({
+      databaseUrl: ":memory:",
+      fetchImpl,
+      geocoderUrl: "https://geocode.test/search",
+      token
+    });
+
+    const created = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      payload: {
+        source: "leasebreak",
+        sourceUrl: "https://www.leasebreak.com/listing/geocode",
+        title: "Geocode Flatiron"
+      },
+      url: "/api/listings"
+    });
+    const id = created.json().listing.id;
+
+    await app.inject({
+      headers: authHeaders,
+      method: "PUT",
+      payload: {
+        address: "28 West 23rd Street",
+        confidence: "exact",
+        geographyCategory: "manhattan",
+        isUserConfirmed: true,
+        label: "Flatiron",
+        source: "exact_address"
+      },
+      url: `/api/listings/${id}/location`
+    });
+
+    const geocoded = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/location/geocode`
+    });
+
+    await app.close();
+
+    expect(geocoded.statusCode).toBe(200);
+    expect(geocoded.json().status).toBe("ok");
+    expect(geocoded.json().location.lat).toBe(40.7421);
+    expect(geocoded.json().listing.location.lng).toBe(-73.9916);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns geocode no-result and missing-query states without changing data", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    const app = buildApp({
+      databaseUrl: ":memory:",
+      fetchImpl,
+      geocoderUrl: "https://geocode.test/search",
+      token
+    });
+
+    const created = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      payload: {
+        source: "airbnb",
+        sourceUrl: "https://www.airbnb.com/rooms/geocode-empty",
+        title: "Geocode missing"
+      },
+      url: "/api/listings"
+    });
+    const id = created.json().listing.id;
+
+    const missing = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/location/geocode`
+    });
+
+    await app.inject({
+      headers: authHeaders,
+      method: "PUT",
+      payload: {
+        label: "Mystery neighborhood",
+        source: "neighborhood"
+      },
+      url: `/api/listings/${id}/location`
+    });
+
+    const noResult = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/location/geocode`
+    });
+
+    await app.close();
+
+    expect(missing.json().status).toBe("missing_query");
+    expect(noResult.json().status).toBe("no_result");
+    expect(noResult.json().location.lat).toBeNull();
+  });
+
+  it("calculates OTP commute when coordinates are present", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            planConnection: {
+              edges: [
+                {
+                  node: {
+                    duration: 1080,
+                    legs: [
+                      { duration: 300, mode: "WALK" },
+                      {
+                        duration: 600,
+                        mode: "SUBWAY",
+                        route: { longName: "N route", mode: "SUBWAY", shortName: "N" }
+                      },
+                      { duration: 180, mode: "WALK" }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }),
+        { status: 200 }
+      )
+    );
+    const app = buildApp({
+      databaseUrl: ":memory:",
+      fetchImpl,
+      otpUrl: "https://otp.test/otp/gtfs/v1",
+      token
+    });
+
+    const created = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      payload: {
+        bedroomCount: 0,
+        earliestMoveIn: "2026-07-01",
+        latestMoveOut: "2026-09-12",
+        monthlyRent: 3200,
+        source: "leasebreak",
+        sourceUrl: "https://www.leasebreak.com/listing/otp",
+        stayType: "entire_apartment",
+        title: "OTP studio"
+      },
+      url: "/api/listings"
+    });
+    const id = created.json().listing.id;
+
+    await app.inject({
+      headers: authHeaders,
+      method: "PUT",
+      payload: {
+        confidence: "exact",
+        geographyCategory: "manhattan",
+        isUserConfirmed: true,
+        label: "Chelsea",
+        lat: 40.7465,
+        lng: -74.0014,
+        source: "exact_address"
+      },
+      url: `/api/listings/${id}/location`
+    });
+
+    const calculated = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/commute/calculate`
+    });
+
+    await app.close();
+
+    expect(calculated.statusCode).toBe(200);
+    expect(calculated.json().status).toBe("ok");
+    expect(calculated.json().commute.totalMinutes).toBe(18);
+    expect(calculated.json().listing.commute.lineNames).toEqual(["N"]);
+    expect(calculated.json().listing.scoreBreakdown.scoreExplanation).toContain("18 minutes");
+  });
+
+  it("keeps manual commute fallback when OTP cannot calculate", async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("connection refused"));
+    const app = buildApp({
+      databaseUrl: ":memory:",
+      fetchImpl,
+      otpUrl: "https://otp.test/otp/gtfs/v1",
+      token
+    });
+
+    const created = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      payload: {
+        source: "airbnb",
+        sourceUrl: "https://www.airbnb.com/rooms/otp-fallback",
+        title: "OTP fallback"
+      },
+      url: "/api/listings"
+    });
+    const id = created.json().listing.id;
+
+    const missingLocation = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/commute/calculate`
+    });
+
+    await app.inject({
+      headers: authHeaders,
+      method: "PUT",
+      payload: {
+        confidence: "exact",
+        geographyCategory: "manhattan",
+        label: "Chelsea",
+        lat: 40.7465,
+        lng: -74.0014,
+        source: "exact_address"
+      },
+      url: `/api/listings/${id}/location`
+    });
+
+    await app.inject({
+      headers: authHeaders,
+      method: "PUT",
+      payload: {
+        totalMinutes: 22,
+        routeSummary: "Manual route"
+      },
+      url: `/api/listings/${id}/commute`
+    });
+
+    const otpDown = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/commute/calculate`
+    });
+
+    await app.close();
+
+    expect(missingLocation.json().status).toBe("missing_location");
+    expect(otpDown.json().status).toBe("otp_unavailable");
+    expect(otpDown.json().commute.totalMinutes).toBe(22);
+    expect(otpDown.json().warnings[0]).toContain("connection refused");
+  });
+
   it("returns deterministic capture suggestions when AI is disabled", async () => {
     const fetchImpl = vi.fn();
     const app = buildApp({ databaseUrl: ":memory:", fetchImpl, openAiApiKey: "test-key", token });

@@ -9,9 +9,11 @@ import {
 
 import type {
   CaptureReview,
+  CalculateCommuteResult,
   DashboardListing,
   DashboardSnapshot,
   DashboardSettings,
+  GeocodeListingResult,
   ListingsCsvExport,
   ListingsJsonExport,
   ManualListingDraft,
@@ -77,7 +79,7 @@ export class PamilaApiClient {
 
   constructor(options: PamilaApiClientOptions = {}) {
     this.baseUrl = options.baseUrl ?? `http://localhost:${DEFAULT_LOCAL_PORTS.api}`;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.token = options.token ?? null;
   }
 
@@ -146,6 +148,44 @@ export class PamilaApiClient {
       }
     );
     return mapApiListing(response.listing);
+  }
+
+  async geocodeListingLocation(id: string): Promise<GeocodeListingResult> {
+    const response = await this.request<{
+      status: GeocodeListingResult["status"];
+      location: ListingLocation | null;
+      listing: ApiListingRecord | null;
+      warnings: string[];
+    }>(`/api/listings/${encodeURIComponent(id)}/location/geocode`, {
+      method: "POST"
+    });
+
+    return {
+      location: response.location,
+      listing: response.listing ? mapApiListing(response.listing) : null,
+      status: response.status,
+      warnings: response.warnings
+    };
+  }
+
+  async calculateListingCommute(id: string): Promise<CalculateCommuteResult> {
+    const response = await this.request<{
+      status: CalculateCommuteResult["status"];
+      commute: CommuteSummary | null;
+      listing: ApiListingRecord | null;
+      warnings: string[];
+      externalDirectionsUrl: string | null;
+    }>(`/api/listings/${encodeURIComponent(id)}/commute/calculate`, {
+      method: "POST"
+    });
+
+    return {
+      commute: response.commute,
+      externalDirectionsUrl: response.externalDirectionsUrl,
+      listing: response.listing ? mapApiListing(response.listing) : null,
+      status: response.status,
+      warnings: response.warnings
+    };
   }
 
   async getListingCaptures(id: string): Promise<CaptureReview[]> {

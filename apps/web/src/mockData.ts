@@ -182,6 +182,8 @@ export const mockDashboardListings: DashboardListing[] = [
             address: "",
             confidenceLabel: "approximate",
             crossStreets: "Court Sq",
+            lat: "",
+            lng: "",
             neighborhood: "Long Island City",
             sourceLabel: "airbnb_approximate"
           }

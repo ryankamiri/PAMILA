@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import type { DivIcon, LayerGroup, Map as LeafletMap } from "leaflet";
+import "leaflet/dist/leaflet.css";
 
 import { DEFAULT_LOCAL_PORTS } from "@pamila/core";
 
@@ -54,6 +56,11 @@ const defaultFilters: ListingFilters = {
   source: "all",
   status: "all",
   text: ""
+};
+
+const RAMP_COORDINATES = {
+  lat: 40.74205,
+  lng: -73.99154
 };
 
 export interface AppProps {
@@ -216,6 +223,8 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
           address: "",
           confidenceLabel: "neighborhood" as const,
           crossStreets: "",
+          lat: "",
+          lng: "",
           neighborhood: draft.neighborhood,
           sourceLabel: "captured_text" as const
         };
@@ -318,6 +327,64 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
       );
       setApiNotice("Commute saved locally until the API commute route is connected.");
       setApiState("offline");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const geocodeLocation = async (listingId: string) => {
+    setPendingAction("Geocoding location...");
+
+    try {
+      const result = await apiClient.geocodeListingLocation(listingId);
+      if (result.listing) {
+        replaceListing(result.listing);
+      } else if (result.location) {
+        setListings((current) =>
+          current.map((listing) =>
+            listing.id === listingId
+              ? {
+                  ...listing,
+                  location: result.location,
+                  updatedAt: new Date().toISOString()
+                }
+              : listing
+          )
+        );
+      }
+
+      setApiState("connected");
+      setApiNotice(
+        result.status === "ok"
+          ? "Saved geocoded coordinates through local API."
+          : `Geocode did not update coordinates: ${result.warnings[0] ?? labelize(result.status)}.`
+      );
+    } catch {
+      setApiState("offline");
+      setApiNotice("Local API unavailable; geocoding requires the API.");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const calculateOtpCommute = async (listingId: string) => {
+    setPendingAction("Calculating OTP commute...");
+
+    try {
+      const result = await apiClient.calculateListingCommute(listingId);
+      if (result.listing) {
+        replaceListing(result.listing);
+      }
+
+      setApiState("connected");
+      setApiNotice(
+        result.status === "ok"
+          ? "Saved OTP commute through local API."
+          : `OTP did not update commute: ${result.warnings[0] ?? labelize(result.status)}.`
+      );
+    } catch {
+      setApiState("offline");
+      setApiNotice("Local API unavailable; OTP commute calculation requires the API.");
     } finally {
       setPendingAction(null);
     }
@@ -518,6 +585,8 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
         {activeView === "detail" && selectedListing ? (
           <ListingDetailView
             listing={selectedListing}
+            onCalculateCommute={calculateOtpCommute}
+            onGeocodeLocation={geocodeLocation}
             onSaveBasics={(listingId, basicsDraft) => {
               const patch = basicsDraftToListingPatch(basicsDraft);
               const current = listings.find((candidate) => candidate.id === listingId);
@@ -540,8 +609,10 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
         ) : null}
 
         {activeView === "commute" ? (
-          <CommutePlaceholderView
+          <MapCommuteView
             listings={filteredListings}
+            onCalculateCommute={calculateOtpCommute}
+            onGeocodeLocation={geocodeLocation}
             onSelect={(listing) => {
               setSelectedListingId(listing.id);
               setActiveView("detail");
@@ -929,12 +1000,16 @@ function ListingCard({
 
 function ListingDetailView({
   listing,
+  onCalculateCommute,
+  onGeocodeLocation,
   onSaveBasics,
   onSaveCommute,
   onSaveLocation,
   onStatusChange
 }: {
   listing: DashboardListing;
+  onCalculateCommute: (listingId: string) => void | Promise<void>;
+  onGeocodeLocation: (listingId: string) => void | Promise<void>;
   onSaveBasics: (listingId: string, draft: ListingBasicsDraft) => void;
   onSaveCommute: (listingId: string, draft: ManualCommuteDraft) => void | Promise<void>;
   onSaveLocation: (listingId: string, draft: ManualLocationDraft) => void | Promise<void>;
@@ -1009,12 +1084,14 @@ function ListingDetailView({
           draft={locationDraft}
           listing={listing}
           onDraftChange={setLocationDraft}
+          onGeocode={() => void onGeocodeLocation(listing.id)}
           onSave={() => void onSaveLocation(listing.id, locationDraft)}
         />
 
         <CommuteEditor
           draft={commuteDraft}
           listing={listing}
+          onCalculate={() => void onCalculateCommute(listing.id)}
           onDraftChange={setCommuteDraft}
           onSave={() => void onSaveCommute(listing.id, commuteDraft)}
         />
@@ -1173,11 +1250,13 @@ function LocationEditor({
   draft,
   listing,
   onDraftChange,
+  onGeocode,
   onSave
 }: {
   draft: ManualLocationDraft;
   listing: DashboardListing;
   onDraftChange: (draft: ManualLocationDraft) => void;
+  onGeocode: () => void;
   onSave: () => void;
 }) {
   return (
@@ -1190,6 +1269,10 @@ function LocationEditor({
         <button className="primary-button compact-action" onClick={onSave} type="button">
           <span aria-hidden="true">s</span>
           Save location
+        </button>
+        <button className="icon-button" onClick={onGeocode} type="button">
+          <span aria-hidden="true">@</span>
+          Geocode
         </button>
       </div>
       <div className="form-row">
@@ -1215,6 +1298,24 @@ function LocationEditor({
           value={draft.neighborhood}
         />
       </Field>
+      <div className="form-row">
+        <Field label="Latitude">
+          <input
+            inputMode="decimal"
+            onChange={(event) => onDraftChange({ ...draft, lat: event.target.value })}
+            placeholder="40.7421"
+            value={draft.lat}
+          />
+        </Field>
+        <Field label="Longitude">
+          <input
+            inputMode="decimal"
+            onChange={(event) => onDraftChange({ ...draft, lng: event.target.value })}
+            placeholder="-73.9916"
+            value={draft.lng}
+          />
+        </Field>
+      </div>
       <div className="form-row">
         <Field label="Confidence">
           <select
@@ -1252,7 +1353,10 @@ function LocationEditor({
       </div>
       <p className="subtle-copy">
         Current: {listing.location?.label ?? "Needs location"} ·{" "}
-        {labelize(listing.locationSourceLabel ?? draft.sourceLabel)}
+        {labelize(listing.locationSourceLabel ?? draft.sourceLabel)} ·{" "}
+        {listing.location?.lat !== null && listing.location?.lng !== null && listing.location?.lat !== undefined && listing.location?.lng !== undefined
+          ? `${listing.location.lat.toFixed(5)}, ${listing.location.lng.toFixed(5)}`
+          : "No coordinates yet"}
       </p>
     </section>
   );
@@ -1261,11 +1365,13 @@ function LocationEditor({
 function CommuteEditor({
   draft,
   listing,
+  onCalculate,
   onDraftChange,
   onSave
 }: {
   draft: ManualCommuteDraft;
   listing: DashboardListing;
+  onCalculate: () => void;
   onDraftChange: (draft: ManualCommuteDraft) => void;
   onSave: () => void;
 }) {
@@ -1288,6 +1394,10 @@ function CommuteEditor({
         >
           <span aria-hidden="true">t</span>
           Stamp time
+        </button>
+        <button className="icon-button" onClick={onCalculate} type="button">
+          <span aria-hidden="true">r</span>
+          Calculate with OTP
         </button>
       </div>
       <div className="form-row">
@@ -1544,41 +1654,161 @@ function FilterBar({
   );
 }
 
-function CommutePlaceholderView({
+export function MapCommuteView({
   listings,
+  onCalculateCommute,
+  onGeocodeLocation,
   onSelect,
   settings
 }: {
   listings: DashboardListing[];
+  onCalculateCommute: (listingId: string) => void | Promise<void>;
+  onGeocodeLocation: (listingId: string) => void | Promise<void>;
   onSelect: (listing: DashboardListing) => void;
   settings: DashboardSettings;
 }) {
+  const mapElementRef = useRef<HTMLDivElement | null>(null);
+  const leafletMapRef = useRef<LeafletMap | null>(null);
+  const markerLayerRef = useRef<LayerGroup | null>(null);
+  const rampLat = settings.officeLat ?? RAMP_COORDINATES.lat;
+  const rampLng = settings.officeLng ?? RAMP_COORDINATES.lng;
+  const withCoordinates = listings.filter(hasListingCoordinates);
+  const needsCoordinates = listings.filter((listing) => listing.location && !hasListingCoordinates(listing));
   const withCommute = listings.filter((listing) => listing.location || listing.commute);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void import("leaflet").then(({ default: Leaflet }) => {
+      if (cancelled || !mapElementRef.current) {
+        return;
+      }
+
+      const map =
+        leafletMapRef.current ??
+        Leaflet.map(mapElementRef.current, {
+          scrollWheelZoom: true
+        }).setView([rampLat, rampLng], 12);
+
+      if (!leafletMapRef.current) {
+        Leaflet.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+          maxZoom: 19
+        }).addTo(map);
+        leafletMapRef.current = map;
+      }
+
+      markerLayerRef.current?.remove();
+      const markerLayer = Leaflet.layerGroup().addTo(map);
+      markerLayerRef.current = markerLayer;
+
+      Leaflet.marker([rampLat, rampLng], {
+        icon: Leaflet.divIcon({
+          className: "pamila-map-marker pamila-map-marker-ramp",
+          html: "<span>Ramp</span>"
+        }) as DivIcon,
+        title: "Ramp NYC"
+      })
+        .bindPopup(`<strong>Ramp NYC</strong><br>${escapeHtml(settings.officeAddress)}`)
+        .addTo(markerLayer);
+
+      for (const listing of withCoordinates) {
+        const location = listing.location;
+        if (!location || location.lat === null || location.lng === null) {
+          continue;
+        }
+
+        Leaflet.marker([location.lat, location.lng], {
+          icon: Leaflet.divIcon({
+            className: `pamila-map-marker pamila-map-marker-${listing.score.hardFilterStatus}`,
+            html: `<span>${listing.score.totalScore}</span>`
+          }) as DivIcon,
+          title: listing.title
+        })
+          .bindPopup(
+            `<strong>${escapeHtml(listing.title)}</strong><br>${escapeHtml(location.label)}<br>${formatCurrency(
+              listing.monthlyRent
+            )}`
+          )
+          .on("click", () => onSelect(listing))
+          .addTo(markerLayer);
+      }
+
+      const boundsPoints = [
+        [rampLat, rampLng] as [number, number],
+        ...withCoordinates.flatMap((listing): Array<[number, number]> => {
+          const location = listing.location;
+          return location?.lat !== null && location?.lng !== null && location?.lat !== undefined && location?.lng !== undefined
+            ? [[location.lat, location.lng]]
+            : [];
+        })
+      ];
+
+      if (boundsPoints.length > 1) {
+        map.fitBounds(Leaflet.latLngBounds(boundsPoints), {
+          maxZoom: 14,
+          padding: [24, 24]
+        });
+      } else {
+        map.setView([rampLat, rampLng], 12);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      markerLayerRef.current?.remove();
+      markerLayerRef.current = null;
+    };
+  }, [listings, onSelect, rampLat, rampLng, settings.officeAddress, withCoordinates]);
 
   return (
     <section className="view-stack">
       <div className="section-heading">
         <div>
-          <p className="eyebrow">Map/Commute placeholder</p>
-          <h3>Route board before OTP map integration</h3>
+          <p className="eyebrow">OSM map and route board</p>
+          <h3>Listings around Ramp</h3>
         </div>
         <p className="section-copy">
-          Pins and polylines will land after OTP routing is wired. For now this view keeps location,
-          route quality, and manual commute checks in one scannable place.
+          Free OpenStreetMap tiles with attribution. Geocode one listing at a time, then calculate
+          transit with local OTP when your graph is running.
         </p>
       </div>
 
-      <article className="map-placeholder" aria-label="Future map area">
-        <div className="map-ramp-marker">
-          <strong>Ramp</strong>
-          <span>{settings.officeAddress}</span>
-        </div>
-        <div className="map-placeholder-grid">
-          <Metric label="Ideal" value={`${settings.idealCommuteMinutes}m`} />
-          <Metric label="Acceptable" value={`${settings.acceptableCommuteMinutes}m`} />
-          <Metric label="Long walk" value={`${settings.longWalkMinutes}m`} />
+      <article className="map-panel" aria-label="OpenStreetMap listing pins">
+        <div className="leaflet-map" data-testid="pamila-osm-map" ref={mapElementRef} />
+        <div className="map-overlay">
+          <Metric label="Pins" value={withCoordinates.length.toString()} />
+          <Metric label="Need coords" value={needsCoordinates.length.toString()} />
+          <Metric label="Ramp" value="28 W 23rd" />
         </div>
       </article>
+
+      {needsCoordinates.length > 0 ? (
+        <section className="needs-coordinates" aria-label="Listings needing coordinates">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Needs coordinates</p>
+              <h3>Geocode before OTP</h3>
+            </div>
+          </div>
+          <div className="coordinate-list">
+            {needsCoordinates.slice(0, 6).map((listing) => (
+              <button
+                className="coordinate-row"
+                key={listing.id}
+                onClick={() => void onGeocodeLocation(listing.id)}
+                type="button"
+              >
+                <span>
+                  <strong>{listing.title}</strong>
+                  <small>{listing.location?.label ?? "Location saved without coordinates"}</small>
+                </span>
+                <span>Geocode</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       {withCommute.length > 0 ? (
         <div className="commute-table" aria-label="Commute summaries">
@@ -1586,12 +1816,24 @@ function CommutePlaceholderView({
             <button className="commute-row" key={listing.id} onClick={() => onSelect(listing)} type="button">
               <span>
                 <strong>{listing.title}</strong>
-                <small>{listing.location?.label ?? "Needs location"}</small>
+                <small>
+                  {listing.location?.label ?? "Needs location"}
+                  {hasListingCoordinates(listing) ? " · mapped" : " · needs coordinates"}
+                </small>
               </span>
               <span>{listing.commute?.totalMinutes ? `${listing.commute.totalMinutes} min` : "No time"}</span>
               <span>{listing.commute?.transferCount ?? "?"} transfers</span>
               <span>{listing.commute?.walkMinutes ? `${listing.commute.walkMinutes} min walk` : "walk ?"}</span>
               <span>{listing.commute?.hasBusHeavyRoute ? "Bus-heavy" : "Rail/walk"}</span>
+              <span
+                className="inline-action"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void onCalculateCommute(listing.id);
+                }}
+              >
+                OTP
+              </span>
             </button>
           ))}
         </div>
@@ -1965,6 +2207,27 @@ function suggestionToListingPatch(suggestion: CaptureSuggestion): ListingUpdateR
     case "location":
       return {};
   }
+}
+
+function hasListingCoordinates(
+  listing: DashboardListing
+): listing is DashboardListing & { location: NonNullable<DashboardListing["location"]> & { lat: number; lng: number } } {
+  return (
+    listing.location !== null &&
+    typeof listing.location.lat === "number" &&
+    Number.isFinite(listing.location.lat) &&
+    typeof listing.location.lng === "number" &&
+    Number.isFinite(listing.location.lng)
+  );
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function downloadTextFile(fileName: string, body: string, contentType: string) {
