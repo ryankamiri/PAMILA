@@ -7,6 +7,7 @@
   "scripts": {
     "dev:web": "pnpm --filter @pamila/web dev",
     "dev:api": "pnpm --filter @pamila/api dev",
+    "dev:extension": "pnpm --filter @pamila/extension dev",
     "build:packages": "pnpm -r --sort --filter @pamila/core --filter @pamila/db --filter @pamila/ui run build",
     "build": "pnpm -r --sort run build",
     "typecheck": "pnpm run build:packages && pnpm -r --sort run typecheck",

@@ -40,16 +40,34 @@
         padding: 10px 14px;
       }
 
+      button.secondary {
+        background: #eef7f4;
+        border: 1px solid #b8d7ce;
+        color: #245f52;
+        margin-left: 8px;
+      }
+
       #status {
         color: #166534;
-        display: inline-block;
+        display: block;
         font-size: 13px;
-        margin-left: 12px;
+        margin-top: 12px;
+      }
+
+      .hint {
+        color: #64748b;
+        font-size: 13px;
+        line-height: 1.45;
+        margin-top: 12px;
       }
     </style>
   </head>
   <body>
     <h1>PAMILA Capture Settings</h1>
+    <p class="hint">
+      Use <strong>dev-local-token</strong> unless you changed <code>PAMILA_LOCAL_TOKEN</code> for the local API.
+      Open Airbnb or Leasebreak pages after saving these settings.
+    </p>
     <form id="settings-form">
       <label for="api-base-url">Local API URL</label>
       <input id="api-base-url" name="api-base-url" type="url" required />
@@ -58,6 +76,8 @@
       <input id="local-token" name="local-token" type="password" autocomplete="off" />
 
       <button type="submit">Save</button>
+      <button class="secondary" id="test-connection" type="button">Test connection</button>
+      <button class="secondary" id="reload-extension" type="button">Reload extension</button>
       <span id="status" role="status"></span>
     </form>
 

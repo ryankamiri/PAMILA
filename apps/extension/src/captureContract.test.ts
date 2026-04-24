@@ -1,6 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_EXTENSION_SETTINGS, EXTENSION_DISPLAY_NAME } from "./captureContract";
+import { checkApiConnection } from "./apiClient";
+import {
+  DEFAULT_EXTENSION_SETTINGS,
+  EXTENSION_DISPLAY_NAME,
+  HELPER_CAPTURE_ACTIVE_TAB_MESSAGE_TYPE,
+  HELPER_CHECK_CONNECTION_MESSAGE_TYPE
+} from "./captureContract";
 import {
   detectListingSource,
   extractApproxAirbnbLocationFromText,
@@ -8,11 +14,22 @@ import {
   normalizeThumbnailCandidates,
   truncateText
 } from "./extraction";
+import { buildHelperViewModel } from "./helperLogic";
+import { classifyExtensionPage } from "./pageClassifier";
 import { normalizeExtensionSettings } from "./settings";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("extension scaffold", () => {
   it("names the capture helper", () => {
     expect(EXTENSION_DISPLAY_NAME).toBe("PAMILA Capture");
+  });
+
+  it("defines helper background message types", () => {
+    expect(HELPER_CAPTURE_ACTIVE_TAB_MESSAGE_TYPE).toBe("PAMILA_HELPER_CAPTURE_ACTIVE_TAB");
+    expect(HELPER_CHECK_CONNECTION_MESSAGE_TYPE).toBe("PAMILA_HELPER_CHECK_CONNECTION");
   });
 });
 
@@ -25,6 +42,101 @@ describe("source detection", () => {
   it("rejects unsupported pages", () => {
     expect(detectListingSource("https://example.com/rooms/12345")).toBeNull();
     expect(detectListingSource("not a url")).toBeNull();
+  });
+});
+
+describe("page classification", () => {
+  it("distinguishes Airbnb search and listing pages", () => {
+    expect(classifyExtensionPage("https://airbnb.com/")).toEqual({
+      source: "airbnb",
+      status: "search_page"
+    });
+    expect(classifyExtensionPage("https://www.airbnb.com/s/New-York--NY/homes")).toEqual({
+      source: "airbnb",
+      status: "search_page"
+    });
+    expect(classifyExtensionPage("https://www.airbnb.com/rooms/12345?adults=1")).toEqual({
+      source: "airbnb",
+      status: "listing_page"
+    });
+  });
+
+  it("distinguishes Leasebreak listing and unsupported pages", () => {
+    expect(classifyExtensionPage("https://www.leasebreak.com/short-term-rental-details/chelsea-studio")).toEqual({
+      source: "leasebreak",
+      status: "listing_page"
+    });
+    expect(classifyExtensionPage("https://www.leasebreak.com/")).toEqual({
+      source: "leasebreak",
+      status: "search_page"
+    });
+    expect(classifyExtensionPage("https://example.com/rooms/12345")).toEqual({
+      source: null,
+      status: "unsupported_page"
+    });
+  });
+});
+
+describe("floating helper guidance", () => {
+  it("shows save guidance for listing pages", () => {
+    const model = buildHelperViewModel(
+      {
+        source: "airbnb",
+        status: "listing_page"
+      },
+      "connected"
+    );
+
+    expect(model.pageStatusLabel).toBe("Listing page");
+    expect(model.apiStatusLabel).toBe("Connected");
+    expect(model.canSaveListing).toBe(true);
+    expect(model.primaryActionLabel).toBe("Save this listing to PAMILA");
+    expect(model.quickSaveVisible).toBe(true);
+    expect(model.quickSaveLabel).toBe("Save to PAMILA");
+    expect(model.quickSaveAction).toBe("save");
+  });
+
+  it("blocks search-page batch capture and shows the search checklist", () => {
+    const model = buildHelperViewModel(
+      {
+        source: "airbnb",
+        status: "search_page"
+      },
+      "token_issue"
+    );
+
+    expect(model.pageStatusLabel).toBe("Search page");
+    expect(model.apiStatusLabel).toBe("Token issue");
+    expect(model.canSaveListing).toBe(false);
+    expect(model.quickSaveVisible).toBe(false);
+    expect(model.quickSaveLabel).toBeNull();
+    expect(model.guidanceBullets.join(" ")).toContain("Open one promising listing page");
+    expect(model.guidanceBullets.join(" ")).toContain("$3,600");
+  });
+
+  it("labels quick-save states for saved and blocked listing pages", () => {
+    const page = {
+      source: "airbnb" as const,
+      status: "listing_page" as const
+    };
+
+    expect(buildHelperViewModel(page, "connected", "saved")).toMatchObject({
+      quickSaveAction: "disabled",
+      quickSaveLabel: "Saved to PAMILA",
+      quickSaveVisible: true
+    });
+
+    expect(buildHelperViewModel(page, "api_offline")).toMatchObject({
+      quickSaveAction: "open_helper",
+      quickSaveLabel: "API offline",
+      quickSaveVisible: true
+    });
+
+    expect(buildHelperViewModel(page, "token_issue")).toMatchObject({
+      quickSaveAction: "open_helper",
+      quickSaveLabel: "Fix token",
+      quickSaveVisible: true
+    });
   });
 });
 
@@ -106,6 +218,45 @@ describe("settings normalization", () => {
     expect(normalizeExtensionSettings({ apiBaseUrl: "http://localhost:7410///" })).toMatchObject({
       ...DEFAULT_EXTENSION_SETTINGS,
       apiBaseUrl: "http://localhost:7410"
+    });
+  });
+});
+
+describe("API connection checks", () => {
+  it("reports connected when health and protected settings pass", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("ok", { status: 200 }))
+        .mockResolvedValueOnce(new Response("ok", { status: 200 }))
+    );
+
+    await expect(checkApiConnection(normalizeExtensionSettings({}))).resolves.toEqual({
+      status: "connected",
+      message: "Connected to PAMILA API."
+    });
+  });
+
+  it("reports token issues when health passes but protected settings reject", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("ok", { status: 200 }))
+        .mockResolvedValueOnce(new Response("unauthorized", { status: 401 }))
+    );
+
+    await expect(checkApiConnection(normalizeExtensionSettings({ localToken: "wrong" }))).resolves.toMatchObject({
+      status: "token_issue"
+    });
+  });
+
+  it("reports API offline when health cannot be reached", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new Error("offline")));
+
+    await expect(checkApiConnection(normalizeExtensionSettings({}))).resolves.toMatchObject({
+      status: "api_offline"
     });
   });
 });

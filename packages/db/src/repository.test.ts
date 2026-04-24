@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { CommuteRouteDetail } from "@pamila/core";
 
 import { canonicalizeUrlForDb, createInMemoryPamilaDb } from "./index.js";
 
@@ -139,9 +140,51 @@ describe("PamilaDatabase", () => {
       neighborhood: "Chelsea",
       source: "neighborhood"
     });
+    const routeDetail = {
+      calculatedAt: "2026-04-16T12:00:00.000Z",
+      destinationLabel: "Ramp NYC",
+      externalDirectionsUrl: "https://www.google.com/maps/dir/?api=1",
+      legs: [
+        {
+          color: "#6b7280",
+          dashArray: "6 6",
+          distanceMeters: 400,
+          durationMinutes: 5,
+          fromName: "Chelsea",
+          geometry: [
+            [40.7465, -74.0014],
+            [40.7421, -73.9916]
+          ],
+          lineName: null,
+          mode: "WALK",
+          routeLongName: null,
+          style: "walk",
+          toName: "23 St"
+        },
+        {
+          color: "#2563eb",
+          dashArray: null,
+          distanceMeters: 1600,
+          durationMinutes: 13,
+          fromName: "23 St",
+          geometry: [
+            [40.7421, -73.9916],
+            [40.74205, -73.99154]
+          ],
+          lineName: "F",
+          mode: "SUBWAY",
+          routeLongName: "F route",
+          style: "rail",
+          toName: "Ramp NYC"
+        }
+      ],
+      originLabel: "Chelsea"
+    } satisfies CommuteRouteDetail;
+
     db.upsertManualCommuteEstimate(listing.id, {
       hasBusHeavyRoute: false,
       lineNames: ["F", "M"],
+      routeDetail,
       routeSummary: "F/M to 23 St",
       totalMinutes: 18,
       transferCount: 0,
@@ -155,6 +198,8 @@ describe("PamilaDatabase", () => {
     });
 
     const backup = db.createBackup();
+    expect(backup.commuteEstimates?.[0]?.routeDetail?.legs[0]?.style).toBe("walk");
+
     const restored = createInMemoryPamilaDb();
     const result = restored.restoreBackup(backup);
 
@@ -171,6 +216,7 @@ describe("PamilaDatabase", () => {
     expect(result.aiAnalysesRestored).toBe(1);
     expect(restoredLocation?.geographyCategory).toBe("manhattan");
     expect(restoredCommute?.lineNames).toEqual(["F", "M"]);
+    expect(restoredCommute?.routeDetail?.legs[1]?.lineName).toBe("F");
     expect(restoredAi?.analysis.hostQuestions).toEqual(["Does July 1 work?"]);
   });
 });

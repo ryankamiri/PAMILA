@@ -1,6 +1,7 @@
 import {
   DEFAULT_LOCAL_PORTS,
   type CapturePayload,
+  type CommuteRouteDetail,
   type CommuteSummary,
   type ListingDateWindow,
   type ListingLocation,
@@ -17,7 +18,8 @@ import type {
   ListingsCsvExport,
   ListingsJsonExport,
   ManualListingDraft,
-  LocationSourceLabel
+  LocationSourceLabel,
+  PrepareCommuteResult
 } from "./dashboardTypes";
 
 export interface PamilaApiClientOptions {
@@ -34,7 +36,7 @@ export interface RecalculateScoresResult {
 export interface CreateListingRequest extends ManualListingDraft {}
 
 export type ListingUpdateRequest = Partial<
-  Omit<DashboardListing, "dateWindow" | "score" | "captureReview">
+  Omit<DashboardListing, "dateWindow" | "score" | "captureReview" | "routeDetail">
 > & {
   dateWindow?: Partial<ListingDateWindow>;
 };
@@ -66,8 +68,9 @@ interface ApiListingRecord {
   scoreBreakdown: ScoreBreakdown | null;
   location?: ListingLocation | null;
   locationSourceLabel?: LocationSourceLabel | null;
-  commute?: CommuteSummary | null;
-  commuteEstimate?: CommuteSummary | null;
+  commute?: (CommuteSummary & { routeDetail?: CommuteRouteDetail | null }) | null;
+  commuteEstimate?: (CommuteSummary & { routeDetail?: CommuteRouteDetail | null }) | null;
+  routeDetail?: CommuteRouteDetail | null;
   lastCommuteCheckedAt?: string | null;
   captureReview?: CaptureReview | null;
 }
@@ -172,6 +175,7 @@ export class PamilaApiClient {
     const response = await this.request<{
       status: CalculateCommuteResult["status"];
       commute: CommuteSummary | null;
+      routeDetail: CommuteRouteDetail | null;
       listing: ApiListingRecord | null;
       warnings: string[];
       externalDirectionsUrl: string | null;
@@ -183,6 +187,33 @@ export class PamilaApiClient {
       commute: response.commute,
       externalDirectionsUrl: response.externalDirectionsUrl,
       listing: response.listing ? mapApiListing(response.listing) : null,
+      routeDetail: response.routeDetail ?? null,
+      status: response.status,
+      warnings: response.warnings
+    };
+  }
+
+  async prepareListingCommute(id: string): Promise<PrepareCommuteResult> {
+    const response = await this.request<{
+      status: PrepareCommuteResult["status"];
+      location: ListingLocation | null;
+      commute: CommuteSummary | null;
+      routeDetail: CommuteRouteDetail | null;
+      listing: ApiListingRecord | null;
+      warnings: string[];
+      nextStep: PrepareCommuteResult["nextStep"];
+      externalDirectionsUrl?: string | null;
+    }>(`/api/listings/${encodeURIComponent(id)}/commute/prepare`, {
+      method: "POST"
+    });
+
+    return {
+      commute: response.commute,
+      externalDirectionsUrl: response.externalDirectionsUrl ?? null,
+      listing: response.listing ? mapApiListing(response.listing) : null,
+      location: response.location,
+      nextStep: response.nextStep,
+      routeDetail: response.routeDetail ?? null,
       status: response.status,
       warnings: response.warnings
     };
@@ -333,6 +364,7 @@ function toUpdateListingBody(patch: ListingUpdateRequest) {
   delete body.captureReview;
   delete body.locationSourceLabel;
   delete body.lastCommuteCheckedAt;
+  delete body.routeDetail;
 
   if (patch.dateWindow) {
     body.availabilitySummary = patch.dateWindow.availabilitySummary;
@@ -372,6 +404,11 @@ function mapApiListing(listing: ApiListingRecord): DashboardListing {
     locationSourceLabel: listing.locationSourceLabel ?? null,
     monthlyRent: listing.monthlyRent,
     nextAction: listing.nextAction ?? "Review listing details and cleanup actions.",
+    routeDetail:
+      listing.routeDetail ??
+      listing.commute?.routeDetail ??
+      listing.commuteEstimate?.routeDetail ??
+      null,
     score: listing.scoreBreakdown ?? pendingApiScore(),
     source: listing.source,
     sourceUrl: listing.sourceUrl,

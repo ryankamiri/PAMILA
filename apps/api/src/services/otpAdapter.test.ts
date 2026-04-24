@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildOtpGraphqlRequest,
   createManualCommuteEstimate,
+  decodeEncodedPolyline,
   mapOtpPlanResponse,
   requestOtpCommute,
   validateOtpOrigin,
@@ -26,6 +27,8 @@ describe("otpAdapter", () => {
     expect(request.query).toContain("planConnection");
     expect(request.query).toContain('latestArrival: "2026-07-01T09:00:00-04:00"');
     expect(request.query).toContain("latitude: 40.7465");
+    expect(request.query).toContain("legGeometry");
+    expect(request.query).toContain("points");
     expect(request.query).toContain("SUBWAY");
     expect(request.query).toContain("BUS");
   });
@@ -50,6 +53,46 @@ describe("otpAdapter", () => {
     expect(mapped.summary.transferCount).toBe(0);
     expect(mapped.summary.lineNames).toEqual(["N"]);
     expect(mapped.summary.hasBusHeavyRoute).toBe(false);
+  });
+
+  it("decodes OTP leg geometry without another dependency", () => {
+    const decoded = decodeEncodedPolyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@");
+
+    expect(decoded).toEqual([
+      [38.5, -120.2],
+      [40.7, -120.95],
+      [43.252, -126.453]
+    ]);
+  });
+
+  it("preserves leg geometry and display metadata in route detail", async () => {
+    const result = await requestOtpCommute(chelseaOrigin, {
+      fetcher: async () => ({
+        json: async () =>
+          otpResponse([
+            itinerary([
+              leg("WALK", 300, undefined, "_p~iF~ps|U_ulLnnqC_mqNvxq`@"),
+              leg("SUBWAY", 900, "N", "_ulLnnqC_mqNvxq`@")
+            ])
+          ]),
+        ok: true,
+        status: 200
+      })
+    });
+
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") {
+      return;
+    }
+    expect(result.routeDetail.destinationLabel).toBe("Ramp NYC");
+    expect(result.routeDetail.legs).toHaveLength(2);
+    expect(result.routeDetail.legs[0]?.style).toBe("walk");
+    expect(result.routeDetail.legs[0]?.geometry.length).toBe(3);
+    expect(result.routeDetail.legs[1]).toMatchObject({
+      color: "#2563eb",
+      lineName: "N",
+      style: "rail"
+    });
   });
 
   it("counts subway transfers and extracts route lines", () => {
@@ -195,11 +238,17 @@ function itinerary(legs: Array<Record<string, unknown>>): Record<string, unknown
   };
 }
 
-function leg(mode: string, duration: number, routeShortName?: string): Record<string, unknown> {
+function leg(
+  mode: string,
+  duration: number,
+  routeShortName?: string,
+  encodedGeometry?: string
+): Record<string, unknown> {
   const base = {
     distance: duration,
     duration,
     from: { name: "Origin" },
+    legGeometry: encodedGeometry ? { points: encodedGeometry } : null,
     mode,
     to: { name: "Destination" }
   };

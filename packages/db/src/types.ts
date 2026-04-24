@@ -1,6 +1,7 @@
 import type {
   BedroomFilter,
   CapturePayload,
+  CommuteRouteDetail,
   CommuteSummary,
   GeographyCategory,
   ListingDateWindow,
@@ -128,12 +129,19 @@ export interface CommuteEstimateRecord extends CommuteSummary {
   id: string;
   listingId: string;
   calculatedAt: string;
+  routeDetail: CommuteRouteDetail | null;
 }
 
 export type UpsertCommuteEstimateInput = Partial<
   Pick<
     CommuteEstimateRecord,
-    "hasBusHeavyRoute" | "lineNames" | "routeSummary" | "totalMinutes" | "transferCount" | "walkMinutes"
+    | "hasBusHeavyRoute"
+    | "lineNames"
+    | "routeDetail"
+    | "routeSummary"
+    | "totalMinutes"
+    | "transferCount"
+    | "walkMinutes"
   >
 > & {
   confidence?: CommuteSummary["confidence"];

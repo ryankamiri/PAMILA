@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { APP_NAME } from "./appConfig";
-import { App, MapCommuteView } from "./App";
+import { App, CommuteRoutePanel, MapCommuteView, OnboardingTour, onboardingSteps } from "./App";
 import { PamilaApiClient } from "./apiClient";
 import {
   applyCaptureSuggestionToListing,
@@ -120,8 +120,48 @@ describe("web dashboard lane", () => {
 
     expect(markup).toContain("Export CSV");
     expect(markup).toContain("Backup");
+    expect(markup).toContain("How PAMILA Works");
     expect(markup).toContain("Map/Commute");
     expect(markup).toContain("Manual Add");
+  });
+
+  it("renders the onboarding tour with workflow and troubleshooting copy", () => {
+    const markup = renderToStaticMarkup(
+      createElement(OnboardingTour, {
+        isOpen: true,
+        onBack: () => undefined,
+        onDismiss: () => undefined,
+        onFinish: () => undefined,
+        onNext: () => undefined,
+        onSkip: () => undefined,
+        stepIndex: 1,
+        steps: onboardingSteps
+      })
+    );
+
+    expect(markup).toContain("API Status");
+    expect(markup).toContain("Connected to local API");
+    expect(markup).toContain("Mock data means");
+    expect(markup).toContain("Back");
+    expect(markup).toContain("Next");
+    expect(markup).toContain("Skip");
+  });
+
+  it("defines onboarding steps for the workflow views", () => {
+    expect(onboardingSteps.map((step) => step.id)).toEqual([
+      "welcome",
+      "api-status",
+      "daily-queue",
+      "inbox-manual-add",
+      "listing-detail",
+      "map-commute",
+      "shortlist-panic",
+      "settings-exports",
+      "daily-use-loop"
+    ]);
+    expect(onboardingSteps.find((step) => step.id === "inbox-manual-add")?.targetView).toBe("inbox");
+    expect(onboardingSteps.find((step) => step.id === "map-commute")?.targetView).toBe("commute");
+    expect(onboardingSteps.find((step) => step.id === "settings-exports")?.targetView).toBe("settings");
   });
 
   it("renders the OSM map shell with Ramp and coordinate queues", () => {
@@ -139,6 +179,111 @@ describe("web dashboard lane", () => {
     expect(markup).toContain("OpenStreetMap");
     expect(markup).toContain("Need coords");
     expect(markup).toContain("Geocode");
+    expect(markup).toContain("Geocode then calculate route");
+    expect(markup).toContain("Route readiness checklist");
+  });
+
+  it("renders route readiness labels for missing, geocodable, coordinate, and saved-route states", () => {
+    const base = mockDashboardListings[0]!;
+    const noLocation = {
+      ...base,
+      id: "route-no-location",
+      location: null,
+      routeDetail: null
+    } satisfies typeof base;
+    const withCoordinates = {
+      ...base,
+      id: "route-with-coordinates",
+      location: {
+        ...base.location!,
+        lat: 40.7465,
+        lng: -74.0014
+      },
+      routeDetail: null
+    } satisfies typeof base;
+
+    const noLocationMarkup = renderToStaticMarkup(
+      createElement(CommuteRoutePanel, {
+        listing: noLocation,
+        onCalculateCommute: () => undefined
+      })
+    );
+    const needsCoordinatesMarkup = renderToStaticMarkup(
+      createElement(CommuteRoutePanel, {
+        listing: base,
+        onCalculateCommute: () => undefined
+      })
+    );
+    const coordinateMarkup = renderToStaticMarkup(
+      createElement(CommuteRoutePanel, {
+        listing: withCoordinates,
+        onCalculateCommute: () => undefined
+      })
+    );
+
+    expect(noLocationMarkup).toContain("Add or accept approximate location first");
+    expect(needsCoordinatesMarkup).toContain("Geocode then calculate route");
+    expect(coordinateMarkup).toContain("Calculate route with OTP");
+    expect(coordinateMarkup).toContain("OTP server status");
+    expect(coordinateMarkup).toContain("Ready to try OTP");
+  });
+
+  it("renders saved route details as leg-by-leg commute steps", () => {
+    const listing = {
+      ...mockDashboardListings[0]!,
+      routeDetail: {
+        calculatedAt: "2026-04-16T12:00:00.000Z",
+        destinationLabel: "Ramp NYC",
+        externalDirectionsUrl: "https://www.google.com/maps/dir/?api=1",
+        legs: [
+          {
+            color: "#6b7280",
+            dashArray: "6 6",
+            distanceMeters: 450,
+            durationMinutes: 5,
+            fromName: "Chelsea",
+            geometry: [
+              [40.7465, -74.0014],
+              [40.7421, -73.9916]
+            ],
+            lineName: null,
+            mode: "WALK",
+            routeLongName: null,
+            style: "walk",
+            toName: "23 St"
+          },
+          {
+            color: "#2563eb",
+            dashArray: null,
+            distanceMeters: 1600,
+            durationMinutes: 13,
+            fromName: "23 St",
+            geometry: [
+              [40.7421, -73.9916],
+              [40.74205, -73.99154]
+            ],
+            lineName: "N",
+            mode: "SUBWAY",
+            routeLongName: "N route",
+            style: "rail",
+            toName: "Ramp NYC"
+          }
+        ],
+        originLabel: "Chelsea"
+      }
+    } satisfies typeof mockDashboardListings[number];
+    const markup = renderToStaticMarkup(
+      createElement(CommuteRoutePanel, {
+        listing,
+        onCalculateCommute: () => undefined
+      })
+    );
+
+    expect(markup).toContain("Route to Ramp");
+    expect(markup).toContain("Subway N");
+    expect(markup).toContain("23 St to Ramp NYC");
+    expect(markup).toContain("Recalculate route");
+    expect(markup).toContain("Saved route detail");
   });
 
   it("flattens listing updates for the existing PATCH endpoint", async () => {
@@ -282,7 +427,7 @@ describe("web dashboard lane", () => {
     });
   });
 
-  it("calls geocode and OTP calculate API routes", async () => {
+  it("calls geocode, OTP calculate, and route prepare API routes", async () => {
     const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
     const apiListing = {
       availabilitySummary: null,
@@ -335,11 +480,14 @@ describe("web dashboard lane", () => {
 
     await client.geocodeListingLocation("listing-test");
     await client.calculateListingCommute("listing-test");
+    await client.prepareListingCommute("listing-test");
 
     expect(calls[0]?.[0]).toBe("http://localhost:7410/api/listings/listing-test/location/geocode");
     expect(calls[0]?.[1]?.method).toBe("POST");
     expect(calls[1]?.[0]).toBe("http://localhost:7410/api/listings/listing-test/commute/calculate");
     expect(calls[1]?.[1]?.method).toBe("POST");
+    expect(calls[2]?.[0]).toBe("http://localhost:7410/api/listings/listing-test/commute/prepare");
+    expect(calls[2]?.[1]?.method).toBe("POST");
   });
 
   it("sends settings updates including Panic Mode and AI capture toggles", async () => {

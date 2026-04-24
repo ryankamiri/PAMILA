@@ -86,6 +86,7 @@ export const mockDashboardListings: DashboardListing[] = [
     bedroomCount: 0,
     bedroomLabel: "Studio",
     commute: commute(18, 5, 0, "N/R/W to 23 St", ["N", "R", "W"]),
+    routeDetail: null,
     createdAt: "2026-04-15T14:00:00.000Z",
     dateWindow: {
       availabilitySummary: "Available Jun 30 through Sep 14",
@@ -121,6 +122,7 @@ export const mockDashboardListings: DashboardListing[] = [
     bedroomCount: 1,
     bedroomLabel: "1 bedroom",
     commute: commute(26, 7, 1, "7 to N/R/W", ["7", "N", "R", "W"]),
+    routeDetail: null,
     createdAt: "2026-04-15T15:30:00.000Z",
     dateWindow: {
       availabilitySummary: "Month to month from July",
@@ -196,6 +198,7 @@ export const mockDashboardListings: DashboardListing[] = [
     bedroomCount: 1,
     bedroomLabel: "Private bedroom",
     commute: commute(21, 4, 0, "L to 6/N/R/W walk transfer", ["L", "6", "N"]),
+    routeDetail: null,
     createdAt: "2026-04-14T20:10:00.000Z",
     dateWindow: {
       availabilitySummary: "Available July 1 to September 12",
@@ -232,6 +235,7 @@ export const mockDashboardListings: DashboardListing[] = [
     bedroomCount: 1,
     bedroomLabel: "1 bedroom",
     commute: commute(19, 3, 0, "Walk or R/W from 28 St", ["R", "W"]),
+    routeDetail: null,
     createdAt: "2026-04-13T17:45:00.000Z",
     dateWindow: {
       availabilitySummary: "Immediate move-in preferred, latest move-in July 3",
@@ -294,6 +298,7 @@ export const mockDashboardListings: DashboardListing[] = [
     bedroomCount: 1,
     bedroomLabel: "1 bedroom",
     commute: commute(34, 16, 1, "Bus to subway, then Q", ["B62", "Q"], true),
+    routeDetail: null,
     createdAt: "2026-04-12T10:20:00.000Z",
     dateWindow: {
       availabilitySummary: "Available June 30 through September 12",

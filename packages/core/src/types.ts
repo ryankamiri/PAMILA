@@ -126,6 +126,30 @@ export interface CommuteSummary {
   confidence: "exact" | "estimated" | "manual";
 }
 
+export type CommuteRouteLegStyle = "walk" | "rail" | "bus" | "ferry" | "other";
+
+export interface CommuteRouteLeg {
+  mode: string;
+  lineName: string | null;
+  routeLongName: string | null;
+  fromName: string | null;
+  toName: string | null;
+  durationMinutes: number | null;
+  distanceMeters: number | null;
+  geometry: Array<[number, number]>;
+  style: CommuteRouteLegStyle;
+  color: string;
+  dashArray: string | null;
+}
+
+export interface CommuteRouteDetail {
+  calculatedAt: string;
+  originLabel: string | null;
+  destinationLabel: string;
+  externalDirectionsUrl: string | null;
+  legs: CommuteRouteLeg[];
+}
+
 export interface ScoreBreakdown {
   totalScore: number;
   commuteScore: number;

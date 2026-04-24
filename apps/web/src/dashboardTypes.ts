@@ -1,5 +1,6 @@
 import type {
   CapturePayload,
+  CommuteRouteDetail,
   CommuteSummary,
   HardFilterStatus,
   ListingCore,
@@ -35,6 +36,7 @@ export interface DashboardListing extends ListingCore {
   location: ListingLocation | null;
   locationSourceLabel?: LocationSourceLabel | null;
   commute: CommuteSummary | null;
+  routeDetail: CommuteRouteDetail | null;
   lastCommuteCheckedAt?: string | null;
   score: ScoreBreakdown;
   nextAction: string;
@@ -149,7 +151,31 @@ export interface GeocodeListingResult {
 export interface CalculateCommuteResult {
   status: "ok" | "missing_location" | "otp_unavailable" | "otp_error" | "no_route";
   commute: CommuteSummary | null;
+  routeDetail: CommuteRouteDetail | null;
   listing: DashboardListing | null;
   warnings: string[];
+  externalDirectionsUrl: string | null;
+}
+
+export interface PrepareCommuteResult {
+  status:
+    | "ok"
+    | "missing_location"
+    | "geocoder_unavailable"
+    | "no_result"
+    | "otp_unavailable"
+    | "otp_error"
+    | "no_route";
+  location: ListingLocation | null;
+  commute: CommuteSummary | null;
+  routeDetail: CommuteRouteDetail | null;
+  listing: DashboardListing | null;
+  warnings: string[];
+  nextStep:
+    | "add_location"
+    | "enter_coordinates"
+    | "retry_geocode"
+    | "manual_commute"
+    | "review_route";
   externalDirectionsUrl: string | null;
 }

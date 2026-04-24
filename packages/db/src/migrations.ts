@@ -181,6 +181,12 @@ export const MIGRATIONS: Migration[] = [
         created_at TEXT NOT NULL
       );
     `
+  },
+  {
+    id: "0002_commute_route_detail",
+    sql: `
+      ALTER TABLE commute_estimates ADD COLUMN route_detail_json TEXT;
+    `
   }
 ];
 

@@ -2,7 +2,11 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { DivIcon, LayerGroup, Map as LeafletMap } from "leaflet";
 import "leaflet/dist/leaflet.css";
 
-import { DEFAULT_LOCAL_PORTS } from "@pamila/core";
+import {
+  DEFAULT_LOCAL_PORTS,
+  type CommuteRouteDetail,
+  type CommuteRouteLeg
+} from "@pamila/core";
 
 import { APP_NAME } from "./appConfig";
 import { defaultApiClient, PamilaApiClient, type ListingUpdateRequest } from "./apiClient";
@@ -63,14 +67,132 @@ const RAMP_COORDINATES = {
   lng: -73.99154
 };
 
+export const ONBOARDING_STORAGE_KEY = "pamila:onboarding:v1:completed";
+
+export type OnboardingStepId =
+  | "welcome"
+  | "api-status"
+  | "daily-queue"
+  | "inbox-manual-add"
+  | "listing-detail"
+  | "map-commute"
+  | "shortlist-panic"
+  | "settings-exports"
+  | "daily-use-loop";
+
+export interface OnboardingStep {
+  body: string[];
+  id: OnboardingStepId;
+  targetId?: string;
+  targetView?: DashboardView;
+  title: string;
+}
+
+export const onboardingSteps: OnboardingStep[] = [
+  {
+    body: [
+      "PAMILA is your local apartment triage cockpit for Airbnb and Leasebreak.",
+      "The point is to turn search chaos into a queue, cleanup pass, scoring view, map, and shortlist."
+    ],
+    id: "welcome",
+    title: "Welcome to PAMILA"
+  },
+  {
+    body: [
+      "Connected to local API means you are looking at real SQLite data from your machine.",
+      "Mock data means the dashboard could not reach the local API, usually because the API is not running or a local token/origin setting is mismatched."
+    ],
+    id: "api-status",
+    targetId: "api-status",
+    title: "API Status"
+  },
+  {
+    body: [
+      "Daily Queue shows the smallest useful set to review first.",
+      "PAMILA prioritizes cleanup urgency, then score, and keeps rejected over-budget listings out of this queue."
+    ],
+    id: "daily-queue",
+    targetId: "daily-queue",
+    targetView: "daily",
+    title: "Daily Queue"
+  },
+  {
+    body: [
+      "Inbox is where captured pages and manual listings enter PAMILA.",
+      "Use it to apply cleanup suggestions and fill missing facts like dates, price, stay type, and location."
+    ],
+    id: "inbox-manual-add",
+    targetId: "inbox-manual-add",
+    targetView: "inbox",
+    title: "Inbox + Manual Add"
+  },
+  {
+    body: [
+      "Listing Detail is where one listing becomes trustworthy.",
+      "Confirm facts, save notes, update status, geocode the location, and enter or calculate commute."
+    ],
+    id: "listing-detail",
+    targetId: "listing-detail",
+    targetView: "detail",
+    title: "Listing Detail"
+  },
+  {
+    body: [
+      "Map/Commute shows Ramp and listing pins for places with coordinates.",
+      "Listings that need coordinates can be geocoded one at a time, and OTP commute calculation has manual fallback when local routing is unavailable."
+    ],
+    id: "map-commute",
+    targetId: "map-commute",
+    targetView: "commute",
+    title: "Map/Commute"
+  },
+  {
+    body: [
+      "Shortlist is for serious candidates you might contact or compare closely.",
+      "Panic Mode reveals fallback private rooms and loosens the search only when the main entire-apartment search is not enough."
+    ],
+    id: "shortlist-panic",
+    targetId: "dashboard-actions",
+    targetView: "shortlist",
+    title: "Shortlist + Panic Mode"
+  },
+  {
+    body: [
+      "Settings holds budget, dates, commute preferences, optional AI capture analysis, and export tools.",
+      "CSV is for spreadsheet comparison, JSON is your full local backup, and API health confirms the backend process is alive."
+    ],
+    id: "settings-exports",
+    targetId: "settings-exports",
+    targetView: "settings",
+    title: "Settings + Exports"
+  },
+  {
+    body: [
+      "Daily loop: capture or add listings, clean facts, confirm location, check commute, shortlist, contact, reject, and export a backup.",
+      "That is the whole rhythm: fewer tabs, more decisions."
+    ],
+    id: "daily-use-loop",
+    title: "Daily Use Loop"
+  }
+];
+
 export interface AppProps {
   apiClient?: PamilaApiClient;
 }
 
 type ApiConnectionState = "loading" | "connected" | "offline";
 
+function getInitialDashboardView(): DashboardView {
+  if (typeof window === "undefined") {
+    return "daily";
+  }
+
+  const hashView = window.location.hash.replace(/^#/, "");
+  return navigationItems.some((item) => item.id === hashView) ? (hashView as DashboardView) : "daily";
+}
+
 export function App({ apiClient = defaultApiClient }: AppProps = {}) {
-  const [activeView, setActiveView] = useState<DashboardView>("daily");
+  const [activeView, setActiveView] = useState<DashboardView>(() => getInitialDashboardView());
   const [listings, setListings] = useState<DashboardListing[]>(initialDashboardSnapshot.listings);
   const [settings, setSettings] = useState<DashboardSettings>(initialDashboardSnapshot.settings);
   const [filters, setFilters] = useState<ListingFilters>(defaultFilters);
@@ -79,6 +201,9 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
   const [apiNotice, setApiNotice] = useState("Loading local API snapshot...");
   const [apiState, setApiState] = useState<ApiConnectionState>("loading");
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
+  const [onboardingStepIndex, setOnboardingStepIndex] = useState(0);
+  const hasCheckedOnboardingRef = useRef(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -113,6 +238,63 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
     };
   }, [apiClient]);
 
+  useEffect(() => {
+    if (apiState === "loading" || hasCheckedOnboardingRef.current) {
+      return;
+    }
+
+    hasCheckedOnboardingRef.current = true;
+
+    if (!hasCompletedOnboarding()) {
+      setOnboardingStepIndex(0);
+      setIsOnboardingOpen(true);
+    }
+  }, [apiState]);
+
+  useEffect(() => {
+    if (!isOnboardingOpen) {
+      return;
+    }
+
+    const targetView = onboardingSteps[onboardingStepIndex]?.targetView;
+    if (targetView && targetView !== activeView) {
+      setActiveView(targetView);
+    }
+  }, [activeView, isOnboardingOpen, onboardingStepIndex]);
+
+  useEffect(() => {
+    if (!isOnboardingOpen || typeof document === "undefined") {
+      return;
+    }
+
+    const targetId = onboardingSteps[onboardingStepIndex]?.targetId;
+    const clearActiveTargets = () => {
+      document.querySelectorAll("[data-tour-active='true']").forEach((element) => {
+        element.removeAttribute("data-tour-active");
+      });
+    };
+
+    clearActiveTargets();
+
+    if (!targetId || typeof window === "undefined") {
+      return clearActiveTargets;
+    }
+
+    const animationFrame = window.requestAnimationFrame(() => {
+      const target = document.querySelector(`[data-tour-target="${targetId}"]`);
+      target?.setAttribute("data-tour-active", "true");
+      target?.scrollIntoView({
+        block: "center",
+        inline: "nearest"
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      clearActiveTargets();
+    };
+  }, [activeView, isOnboardingOpen, onboardingStepIndex]);
+
   const filteredListings = useMemo(() => applyListingFilters(listings, filters), [filters, listings]);
   const dailyQueue = useMemo(() => getDailyQueue(listings), [listings]);
   const shortlist = useMemo(() => getShortlist(listings), [listings]);
@@ -129,6 +311,29 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
     [listings, shortlist.length]
   );
 
+  const openOnboarding = () => {
+    setOnboardingStepIndex(0);
+    setIsOnboardingOpen(true);
+  };
+
+  const closeOnboarding = () => {
+    setIsOnboardingOpen(false);
+  };
+
+  const finishOnboarding = () => {
+    markOnboardingCompleted();
+    setIsOnboardingOpen(false);
+  };
+
+  const moveOnboarding = (nextIndex: number) => {
+    const clampedIndex = Math.max(0, Math.min(onboardingSteps.length - 1, nextIndex));
+    const targetView = onboardingSteps[clampedIndex]?.targetView;
+    if (targetView) {
+      setActiveView(targetView);
+    }
+    setOnboardingStepIndex(clampedIndex);
+  };
+
   const replaceListing = (updatedListing: DashboardListing) => {
     setListings((current) =>
       current.map((listing) =>
@@ -142,7 +347,8 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
                 updatedListing.lastCommuteCheckedAt ?? listing.lastCommuteCheckedAt ?? null,
               location: updatedListing.location ?? listing.location,
               locationSourceLabel:
-                updatedListing.locationSourceLabel ?? listing.locationSourceLabel ?? null
+                updatedListing.locationSourceLabel ?? listing.locationSourceLabel ?? null,
+              routeDetail: updatedListing.routeDetail ?? listing.routeDetail ?? null
             }
           : listing
       )
@@ -368,10 +574,10 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
   };
 
   const calculateOtpCommute = async (listingId: string) => {
-    setPendingAction("Calculating OTP commute...");
+    setPendingAction("Preparing route...");
 
     try {
-      const result = await apiClient.calculateListingCommute(listingId);
+      const result = await apiClient.prepareListingCommute(listingId);
       if (result.listing) {
         replaceListing(result.listing);
       }
@@ -379,12 +585,12 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
       setApiState("connected");
       setApiNotice(
         result.status === "ok"
-          ? "Saved OTP commute through local API."
-          : `OTP did not update commute: ${result.warnings[0] ?? labelize(result.status)}.`
+          ? `Saved route through local API.${result.warnings[0] ? ` ${result.warnings[0]}` : ""}`
+          : `Route is not ready: ${result.warnings[0] ?? labelize(result.status)}.`
       );
     } catch {
       setApiState("offline");
-      setApiNotice("Local API unavailable; OTP commute calculation requires the API.");
+      setApiNotice("Local API unavailable; route preparation requires the API.");
     } finally {
       setPendingAction(null);
     }
@@ -461,7 +667,7 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar" aria-label="PAMILA navigation">
+      <aside className="sidebar" aria-label="PAMILA navigation" data-tour-target="sidebar-navigation">
         <div className="brand">
           <span className="brand-mark" aria-hidden="true">
             P
@@ -499,12 +705,12 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
           <div>
             <p className="eyebrow">Apartment triage cockpit</p>
             <h2>{viewTitle(activeView)}</h2>
-            <p className={`api-notice api-${apiState}`}>
+            <p className={`api-notice api-${apiState}`} data-tour-target="api-status">
               {pendingAction ? `${pendingAction} ` : ""}
               {apiNotice}
             </p>
           </div>
-          <div className="header-actions" aria-label="Dashboard actions">
+          <div className="header-actions" aria-label="Dashboard actions" data-tour-target="dashboard-actions">
             <button
               className={filters.includeFallback ? "toggle toggle-on" : "toggle"}
               onClick={() =>
@@ -525,6 +731,10 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
             <button className="text-button" onClick={() => void exportData("json")} type="button">
               <span aria-hidden="true">J</span>
               Backup JSON
+            </button>
+            <button className="text-button" onClick={openOnboarding} type="button">
+              <span aria-hidden="true">?</span>
+              How PAMILA Works
             </button>
             <a className="text-button" href={`http://localhost:${DEFAULT_LOCAL_PORTS.api}/health`}>
               API health
@@ -632,7 +842,113 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
           />
         ) : null}
       </main>
+
+      <OnboardingTour
+        isOpen={isOnboardingOpen}
+        onBack={() => moveOnboarding(onboardingStepIndex - 1)}
+        onDismiss={closeOnboarding}
+        onFinish={finishOnboarding}
+        onNext={() => moveOnboarding(onboardingStepIndex + 1)}
+        onSkip={finishOnboarding}
+        stepIndex={onboardingStepIndex}
+        steps={onboardingSteps}
+      />
     </div>
+  );
+}
+
+export function OnboardingTour({
+  isOpen,
+  onBack,
+  onDismiss,
+  onFinish,
+  onNext,
+  onSkip,
+  stepIndex,
+  steps
+}: {
+  isOpen: boolean;
+  onBack: () => void;
+  onDismiss: () => void;
+  onFinish: () => void;
+  onNext: () => void;
+  onSkip: () => void;
+  stepIndex: number;
+  steps: OnboardingStep[];
+}) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const step = steps[stepIndex] ?? steps[0];
+  const isFirstStep = stepIndex <= 0;
+  const isLastStep = stepIndex >= steps.length - 1;
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    dialogRef.current?.focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onDismiss();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isOpen, onDismiss, stepIndex]);
+
+  if (!isOpen || !step) {
+    return null;
+  }
+
+  return (
+    <>
+      <div className="tour-backdrop" aria-hidden="true" />
+      <div
+        aria-describedby="pamila-onboarding-description"
+        aria-labelledby="pamila-onboarding-title"
+        aria-modal="true"
+        className={step.targetId ? "tour-dialog" : "tour-dialog tour-dialog-centered"}
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
+        <div className="tour-progress">
+          <span>Step {stepIndex + 1} of {steps.length}</span>
+          {step.targetId ? <span>Highlighted in the app</span> : <span>Overview</span>}
+        </div>
+        <h3 id="pamila-onboarding-title">{step.title}</h3>
+        <div className="tour-body" id="pamila-onboarding-description">
+          {step.body.map((paragraph) => (
+            <p key={paragraph}>{paragraph}</p>
+          ))}
+        </div>
+        <div className="tour-actions">
+          <button className="text-button" onClick={onSkip} type="button">
+            <span aria-hidden="true">x</span>
+            Skip
+          </button>
+          <div className="tour-step-actions">
+            <button className="icon-button" disabled={isFirstStep} onClick={onBack} type="button">
+              <span aria-hidden="true">&lt;</span>
+              Back
+            </button>
+            {isLastStep ? (
+              <button className="primary-button compact-action" onClick={onFinish} type="button">
+                <span aria-hidden="true">v</span>
+                Finish
+              </button>
+            ) : (
+              <button className="primary-button compact-action" onClick={onNext} type="button">
+                <span aria-hidden="true">&gt;</span>
+                Next
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -646,7 +962,7 @@ function DailyQueueView({
   onStatusChange: (listingId: string, status: DashboardListing["status"]) => void;
 }) {
   return (
-    <section className="view-stack">
+    <section className="view-stack" data-tour-target="daily-queue">
       <div className="section-heading">
         <div>
           <p className="eyebrow">Next best actions</p>
@@ -703,7 +1019,7 @@ function InboxView({
   );
 
   return (
-    <section className="two-column-view">
+    <section className="two-column-view" data-tour-target="inbox-manual-add">
       <div className="view-stack">
         <FilterBar filters={filters} onFiltersChange={onFiltersChange} />
         <CaptureCleanupQueue
@@ -1026,7 +1342,7 @@ function ListingDetailView({
   }, [listing]);
 
   return (
-    <section className="detail-layout">
+    <section className="detail-layout" data-tour-target="listing-detail">
       <article className="detail-main">
         <div className="section-heading">
           <div>
@@ -1094,6 +1410,11 @@ function ListingDetailView({
           onCalculate={() => void onCalculateCommute(listing.id)}
           onDraftChange={setCommuteDraft}
           onSave={() => void onSaveCommute(listing.id, commuteDraft)}
+        />
+
+        <CommuteRoutePanel
+          listing={listing}
+          onCalculateCommute={onCalculateCommute}
         />
       </article>
 
@@ -1397,7 +1718,7 @@ function CommuteEditor({
         </button>
         <button className="icon-button" onClick={onCalculate} type="button">
           <span aria-hidden="true">r</span>
-          Calculate with OTP
+          {routeActionLabel(listing)}
         </button>
       </div>
       <div className="form-row">
@@ -1462,6 +1783,174 @@ function CommuteEditor({
         </span>
       </div>
     </section>
+  );
+}
+
+export function CommuteRoutePanel({
+  listing,
+  onCalculateCommute,
+  onSelect
+}: {
+  listing: DashboardListing | null;
+  onCalculateCommute?: (listingId: string) => void | Promise<void>;
+  onSelect?: (listing: DashboardListing) => void;
+}) {
+  if (!listing) {
+    return (
+      <section className="route-detail-panel" aria-label="Selected commute route">
+        <p className="eyebrow">Selected route</p>
+        <h3>Pick a listing</h3>
+        <p className="subtle-copy">Select a mapped listing or commute row to inspect one route to Ramp.</p>
+      </section>
+    );
+  }
+
+  const routeDetail = listing.routeDetail;
+  const routeLines = routeLinesLabel(listing.commute, routeDetail);
+  const approximateLocation = listing.location ? isApproximateRouteLocation(listing.location) : false;
+
+  return (
+    <section className="route-detail-panel" aria-label="Selected commute route">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Selected route</p>
+          <h3>Route to Ramp</h3>
+          <p className="subtle-copy">{listing.title}</p>
+        </div>
+        <div className="route-panel-actions">
+          {onSelect ? (
+            <button className="icon-button" onClick={() => onSelect(listing)} type="button">
+              <span aria-hidden="true">#</span>
+              Details
+            </button>
+          ) : null}
+          {onCalculateCommute ? (
+            <button
+              className="primary-button compact-action"
+              onClick={() => void onCalculateCommute(listing.id)}
+              type="button"
+            >
+              <span aria-hidden="true">r</span>
+              {routeActionLabel(listing)}
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      <RouteReadinessChecklist listing={listing} />
+
+      {approximateLocation ? (
+        <p className="route-warning">
+          Route uses approximate location; confirm exact address before final decision.
+        </p>
+      ) : null}
+
+      <div className="route-metrics" aria-label="Route summary">
+        <Metric
+          label="Total"
+          value={listing.commute?.totalMinutes ? `${listing.commute.totalMinutes} min` : "Unknown"}
+        />
+        <Metric label="Transfers" value={String(listing.commute?.transferCount ?? "?")} />
+        <Metric
+          label="Walk"
+          value={listing.commute?.walkMinutes ? `${listing.commute.walkMinutes} min` : "Unknown"}
+        />
+        <Metric label="Lines" value={routeLines} />
+      </div>
+
+      {routeDetail ? (
+        <>
+          <p className="subtle-copy">
+            Calculated {formatDateTime(routeDetail.calculatedAt)} from{" "}
+            {routeDetail.originLabel ?? listing.location?.label ?? "listing"} to{" "}
+            {routeDetail.destinationLabel}.
+            {routeDetail.externalDirectionsUrl ? (
+              <>
+                {" "}
+                <a href={routeDetail.externalDirectionsUrl} rel="noreferrer" target="_blank">
+                  Open fallback directions
+                </a>
+              </>
+            ) : null}
+          </p>
+
+          <div className="route-leg-list" aria-label="Route legs">
+            {routeDetail.legs.length > 0 ? (
+              routeDetail.legs.map((leg, index) => (
+                <div className="route-leg-row" key={`${leg.mode}-${index}-${leg.fromName ?? "from"}`}>
+                  <span className={`route-leg-swatch route-leg-${leg.style}`} aria-hidden="true" />
+                  <span>
+                    <strong>{routeLegTitle(leg)}</strong>
+                    <small>{routeLegEndpoints(leg)}</small>
+                    {leg.geometry.length <= 1 ? (
+                      <small>No drawable geometry for this leg</small>
+                    ) : null}
+                  </span>
+                  <span>{formatRouteLegDuration(leg.durationMinutes)}</span>
+                  <span>{formatRouteLegDistance(leg.distanceMeters)}</span>
+                </div>
+              ))
+            ) : (
+              <p className="empty-state">OTP saved a route shell, but no leg details came back.</p>
+            )}
+          </div>
+        </>
+      ) : (
+        <p className="empty-state">
+          {routeEmptyStateCopy(listing)}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function RouteReadinessChecklist({ listing }: { listing: DashboardListing }) {
+  const hasLocationLabel = Boolean(listing.location?.label?.trim());
+  const hasCoordinates = hasListingCoordinates(listing);
+  const routeSaved = Boolean(listing.routeDetail);
+  const otpState = routeSaved ? "Route saved" : hasCoordinates ? "Ready to try OTP" : "Waiting for coordinates";
+
+  return (
+    <div className="route-readiness" aria-label="Route readiness checklist">
+      <RouteReadinessItem
+        label="Location label"
+        ok={hasLocationLabel}
+        value={listing.location?.label ?? "Missing"}
+      />
+      <RouteReadinessItem
+        label="Coordinates"
+        ok={hasCoordinates}
+        value={hasCoordinates ? `${listing.location.lat.toFixed(5)}, ${listing.location.lng.toFixed(5)}` : "Missing"}
+      />
+      <RouteReadinessItem
+        label="OTP server status"
+        ok={routeSaved}
+        value={otpState}
+      />
+      <RouteReadinessItem
+        label="Saved route detail"
+        ok={routeSaved}
+        value={routeSaved ? `Saved ${formatDateTime(listing.routeDetail?.calculatedAt ?? null)}` : "Not saved"}
+      />
+    </div>
+  );
+}
+
+function RouteReadinessItem({
+  label,
+  ok,
+  value
+}: {
+  label: string;
+  ok: boolean;
+  value: string;
+}) {
+  return (
+    <div className={`route-readiness-item ${ok ? "route-readiness-ok" : ""}`}>
+      <span aria-hidden="true">{ok ? "ok" : "!"}</span>
+      <strong>{label}</strong>
+      <small>{value}</small>
+    </div>
   );
 }
 
@@ -1670,14 +2159,44 @@ export function MapCommuteView({
   const mapElementRef = useRef<HTMLDivElement | null>(null);
   const leafletMapRef = useRef<LeafletMap | null>(null);
   const markerLayerRef = useRef<LayerGroup | null>(null);
+  const routeLayerRef = useRef<LayerGroup | null>(null);
   const rampLat = settings.officeLat ?? RAMP_COORDINATES.lat;
   const rampLng = settings.officeLng ?? RAMP_COORDINATES.lng;
-  const withCoordinates = listings.filter(hasListingCoordinates);
-  const needsCoordinates = listings.filter((listing) => listing.location && !hasListingCoordinates(listing));
-  const withCommute = listings.filter((listing) => listing.location || listing.commute);
+  const withCoordinates = useMemo(() => listings.filter(hasListingCoordinates), [listings]);
+  const needsCoordinates = useMemo(
+    () => listings.filter((listing) => listing.location && !hasListingCoordinates(listing)),
+    [listings]
+  );
+  const withCommute = useMemo(
+    () => listings.filter((listing) => listing.location || listing.commute),
+    [listings]
+  );
+  const defaultRouteListingId =
+    listings.find((listing) => listing.routeDetail)?.id ??
+    withCoordinates[0]?.id ??
+    withCommute[0]?.id ??
+    "";
+  const [selectedRouteListingId, setSelectedRouteListingId] = useState(defaultRouteListingId);
+  const selectedRouteListing =
+    listings.find((listing) => listing.id === selectedRouteListingId) ??
+    listings.find((listing) => listing.id === defaultRouteListingId) ??
+    null;
+  const selectedRouteDetail = selectedRouteListing?.routeDetail ?? null;
+
+  useEffect(() => {
+    if (!defaultRouteListingId) {
+      setSelectedRouteListingId("");
+      return;
+    }
+
+    if (!selectedRouteListingId || !listings.some((listing) => listing.id === selectedRouteListingId)) {
+      setSelectedRouteListingId(defaultRouteListingId);
+    }
+  }, [defaultRouteListingId, listings, selectedRouteListingId]);
 
   useEffect(() => {
     let cancelled = false;
+    let resizeFrame: number | null = null;
 
     void import("leaflet").then(({ default: Leaflet }) => {
       if (cancelled || !mapElementRef.current) {
@@ -1701,6 +2220,25 @@ export function MapCommuteView({
       markerLayerRef.current?.remove();
       const markerLayer = Leaflet.layerGroup().addTo(map);
       markerLayerRef.current = markerLayer;
+      routeLayerRef.current?.remove();
+      const routeLayer = Leaflet.layerGroup().addTo(map);
+      routeLayerRef.current = routeLayer;
+
+      if (selectedRouteDetail) {
+        for (const leg of selectedRouteDetail.legs) {
+          if (leg.geometry.length <= 1) {
+            continue;
+          }
+
+          Leaflet.polyline(leg.geometry, {
+            className: "pamila-route-line",
+            color: leg.color,
+            dashArray: leg.dashArray ?? undefined,
+            opacity: 0.9,
+            weight: leg.style === "walk" ? 4 : 5
+          }).addTo(routeLayer);
+        }
+      }
 
       Leaflet.marker([rampLat, rampLng], {
         icon: Leaflet.divIcon({
@@ -1730,10 +2268,11 @@ export function MapCommuteView({
               listing.monthlyRent
             )}`
           )
-          .on("click", () => onSelect(listing))
+          .on("click", () => setSelectedRouteListingId(listing.id))
           .addTo(markerLayer);
       }
 
+      const routeBoundsPoints = selectedRouteDetail?.legs.flatMap((leg) => leg.geometry) ?? [];
       const boundsPoints = [
         [rampLat, rampLng] as [number, number],
         ...withCoordinates.flatMap((listing): Array<[number, number]> => {
@@ -1741,28 +2280,38 @@ export function MapCommuteView({
           return location?.lat !== null && location?.lng !== null && location?.lat !== undefined && location?.lng !== undefined
             ? [[location.lat, location.lng]]
             : [];
-        })
+        }),
+        ...routeBoundsPoints
       ];
 
-      if (boundsPoints.length > 1) {
-        map.fitBounds(Leaflet.latLngBounds(boundsPoints), {
-          maxZoom: 14,
-          padding: [24, 24]
-        });
-      } else {
-        map.setView([rampLat, rampLng], 12);
-      }
+      resizeFrame = window.requestAnimationFrame(() => {
+        map.invalidateSize();
+
+        if (boundsPoints.length > 1) {
+          map.fitBounds(Leaflet.latLngBounds(boundsPoints), {
+            maxZoom: 14,
+            padding: [24, 24]
+          });
+        } else {
+          map.setView([rampLat, rampLng], 12);
+        }
+      });
     });
 
     return () => {
       cancelled = true;
+      if (resizeFrame !== null) {
+        window.cancelAnimationFrame(resizeFrame);
+      }
       markerLayerRef.current?.remove();
       markerLayerRef.current = null;
+      routeLayerRef.current?.remove();
+      routeLayerRef.current = null;
     };
-  }, [listings, onSelect, rampLat, rampLng, settings.officeAddress, withCoordinates]);
+  }, [rampLat, rampLng, selectedRouteDetail, settings.officeAddress, withCoordinates]);
 
   return (
-    <section className="view-stack">
+    <section className="view-stack" data-tour-target="map-commute">
       <div className="section-heading">
         <div>
           <p className="eyebrow">OSM map and route board</p>
@@ -1782,6 +2331,12 @@ export function MapCommuteView({
           <Metric label="Ramp" value="28 W 23rd" />
         </div>
       </article>
+
+      <CommuteRoutePanel
+        listing={selectedRouteListing}
+        onCalculateCommute={onCalculateCommute}
+        onSelect={onSelect}
+      />
 
       {needsCoordinates.length > 0 ? (
         <section className="needs-coordinates" aria-label="Listings needing coordinates">
@@ -1813,7 +2368,13 @@ export function MapCommuteView({
       {withCommute.length > 0 ? (
         <div className="commute-table" aria-label="Commute summaries">
           {withCommute.map((listing) => (
-            <button className="commute-row" key={listing.id} onClick={() => onSelect(listing)} type="button">
+            <button
+              aria-pressed={selectedRouteListing?.id === listing.id}
+              className={`commute-row ${selectedRouteListing?.id === listing.id ? "commute-row-active" : ""}`}
+              key={listing.id}
+              onClick={() => setSelectedRouteListingId(listing.id)}
+              type="button"
+            >
               <span>
                 <strong>{listing.title}</strong>
                 <small>
@@ -1824,7 +2385,7 @@ export function MapCommuteView({
               <span>{listing.commute?.totalMinutes ? `${listing.commute.totalMinutes} min` : "No time"}</span>
               <span>{listing.commute?.transferCount ?? "?"} transfers</span>
               <span>{listing.commute?.walkMinutes ? `${listing.commute.walkMinutes} min walk` : "walk ?"}</span>
-              <span>{listing.commute?.hasBusHeavyRoute ? "Bus-heavy" : "Rail/walk"}</span>
+              <span>{listing.routeDetail ? "Route saved" : listing.commute?.hasBusHeavyRoute ? "Bus-heavy" : "Rail/walk"}</span>
               <span
                 className="inline-action"
                 onClick={(event) => {
@@ -1832,7 +2393,7 @@ export function MapCommuteView({
                   void onCalculateCommute(listing.id);
                 }}
               >
-                OTP
+                {routeActionLabel(listing)}
               </span>
             </button>
           ))}
@@ -1892,7 +2453,7 @@ function SettingsView({
   }, [settings]);
 
   return (
-    <section className="settings-grid">
+    <section className="settings-grid" data-tour-target="settings-exports">
       <article className="settings-panel">
         <p className="eyebrow">Default search profile</p>
         <h3>Search defaults</h3>
@@ -2209,6 +2770,89 @@ function suggestionToListingPatch(suggestion: CaptureSuggestion): ListingUpdateR
   }
 }
 
+function routeLinesLabel(
+  commute: DashboardListing["commute"],
+  routeDetail: CommuteRouteDetail | null
+) {
+  const lines =
+    commute?.lineNames.length
+      ? commute.lineNames
+      : routeDetail?.legs
+          .map((leg) => leg.lineName)
+          .filter((line): line is string => Boolean(line)) ?? [];
+
+  return lines.length > 0 ? [...new Set(lines)].join(", ") : "Walk";
+}
+
+function routeActionLabel(listing: DashboardListing) {
+  if (listing.routeDetail) {
+    return "Recalculate route";
+  }
+
+  if (!listing.location) {
+    return "Add or accept approximate location first";
+  }
+
+  if (!hasListingCoordinates(listing)) {
+    return "Geocode then calculate route";
+  }
+
+  return "Calculate route with OTP";
+}
+
+function routeEmptyStateCopy(listing: DashboardListing) {
+  if (!listing.location) {
+    return "No saved route detail yet. Add or accept approximate location first, then prepare the route.";
+  }
+
+  if (!hasListingCoordinates(listing)) {
+    return "No saved route detail yet. Geocode this listing, then calculate transit with local OTP.";
+  }
+
+  return "No saved route detail yet. Calculate this listing with local OTP, or keep using the manual commute fields above.";
+}
+
+function isApproximateRouteLocation(location: NonNullable<DashboardListing["location"]>) {
+  return (
+    location.source === "airbnb_approx_pin" ||
+    location.source === "neighborhood" ||
+    location.confidence === "low"
+  );
+}
+
+function routeLegTitle(leg: CommuteRouteLeg) {
+  const modeLabel = labelize(leg.mode.toLowerCase());
+  if (leg.lineName) {
+    return `${modeLabel} ${leg.lineName}`;
+  }
+  if (leg.routeLongName) {
+    return `${modeLabel} ${leg.routeLongName}`;
+  }
+  return modeLabel;
+}
+
+function routeLegEndpoints(leg: CommuteRouteLeg) {
+  const from = leg.fromName ?? "origin";
+  const to = leg.toName ?? "next stop";
+  return `${from} to ${to}`;
+}
+
+function formatRouteLegDuration(minutes: number | null) {
+  return minutes === null ? "time ?" : `${minutes} min`;
+}
+
+function formatRouteLegDistance(distanceMeters: number | null) {
+  if (distanceMeters === null) {
+    return "distance ?";
+  }
+
+  if (distanceMeters < 1000) {
+    return `${Math.round(distanceMeters)} m`;
+  }
+
+  return `${(distanceMeters / 1609.34).toFixed(1)} mi`;
+}
+
 function hasListingCoordinates(
   listing: DashboardListing
 ): listing is DashboardListing & { location: NonNullable<DashboardListing["location"]> & { lat: number; lng: number } } {
@@ -2242,6 +2886,30 @@ function downloadTextFile(fileName: string, body: string, contentType: string) {
   link.download = fileName;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function hasCompletedOnboarding() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(ONBOARDING_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function markOnboardingCompleted() {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(ONBOARDING_STORAGE_KEY, "true");
+  } catch {
+    // The tour still works when localStorage is unavailable; it just will not persist completion.
+  }
 }
 
 function parseIntegerDraft(value: string, fallback: number): number {

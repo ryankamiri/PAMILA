@@ -5,10 +5,14 @@ const STORAGE_KEY = "pamilaExtensionSettings";
 export function normalizeExtensionSettings(input: Partial<ExtensionSettings> | null | undefined): ExtensionSettings {
   const rawApiBaseUrl = typeof input?.apiBaseUrl === "string" ? input.apiBaseUrl : DEFAULT_EXTENSION_SETTINGS.apiBaseUrl;
   const apiBaseUrl = rawApiBaseUrl.replace(/\/+$/g, "") || DEFAULT_EXTENSION_SETTINGS.apiBaseUrl;
+  const rawLocalToken =
+    typeof input?.localToken === "string"
+      ? input.localToken.trim()
+      : DEFAULT_EXTENSION_SETTINGS.localToken;
 
   return {
     apiBaseUrl,
-    localToken: typeof input?.localToken === "string" ? input.localToken : DEFAULT_EXTENSION_SETTINGS.localToken,
+    localToken: rawLocalToken || DEFAULT_EXTENSION_SETTINGS.localToken,
     pageTextLimit: normalizePositiveInteger(input?.pageTextLimit, DEFAULT_EXTENSION_SETTINGS.pageTextLimit),
     selectedTextLimit: normalizePositiveInteger(input?.selectedTextLimit, DEFAULT_EXTENSION_SETTINGS.selectedTextLimit),
     thumbnailLimit: normalizePositiveInteger(input?.thumbnailLimit, DEFAULT_EXTENSION_SETTINGS.thumbnailLimit)

@@ -1,6 +1,9 @@
 import {
   DEFAULT_LOCAL_PORTS,
   RAMP_OFFICE,
+  type CommuteRouteDetail,
+  type CommuteRouteLeg,
+  type CommuteRouteLegStyle,
   type CommuteSummary,
   type LocationConfidence,
   type LocationSource
@@ -47,6 +50,7 @@ export interface MappedOtpLeg {
   durationSeconds: number | null;
   distanceMeters: number | null;
   fromName: string | null;
+  geometry: Array<[number, number]>;
   toName: string | null;
   routeShortName: string | null;
   routeLongName: string | null;
@@ -80,6 +84,7 @@ export type OtpCommuteEstimateResult =
       summary: CommuteSummary;
       itinerary: MappedOtpItinerary;
       request: OtpGraphqlRequest;
+      routeDetail: CommuteRouteDetail;
       warnings: string[];
       externalDirectionsUrl: string | null;
     }
@@ -166,6 +171,7 @@ export function buildOtpGraphqlRequest(
           end
           from { name }
           to { name }
+          legGeometry { points }
           route {
             gtfsId
             longName
@@ -251,6 +257,12 @@ export async function requestOtpCommute(
       externalDirectionsUrl,
       itinerary: mapped.itinerary,
       request,
+      routeDetail: buildRouteDetail(mapped.itinerary, {
+        calculatedAt: new Date().toISOString(),
+        destinationLabel: options.destinationLabel ?? DEFAULT_OTP_REQUEST_OPTIONS.destinationLabel,
+        externalDirectionsUrl,
+        originLabel: origin.label ?? origin.address ?? origin.crossStreets ?? origin.neighborhood ?? null
+      }),
       status: "ok",
       summary: mapped.summary,
       warnings: [...originValidation.warnings, ...mapped.warnings]
@@ -462,13 +474,16 @@ function mapItinerary(node: Record<string, unknown>): MappedOtpItinerary {
 function mapLeg(leg: Record<string, unknown>): MappedOtpLeg {
   const route = getRecord(leg, "route");
   const from = getRecord(leg, "from");
+  const legGeometry = getRecord(leg, "legGeometry");
   const to = getRecord(leg, "to");
   const mode = getString(leg, "mode") ?? getString(route, "mode") ?? "UNKNOWN";
+  const encodedGeometry = getString(legGeometry, "points");
 
   return {
     distanceMeters: getNumber(leg, "distance"),
     durationSeconds: getDurationSeconds(leg),
     fromName: getString(from, "name"),
+    geometry: encodedGeometry ? decodeEncodedPolyline(encodedGeometry) : [],
     mode,
     routeLongName: getString(route, "longName"),
     routeMode: getString(route, "mode"),
@@ -506,6 +521,88 @@ function summarizeItinerary(itinerary: MappedOtpItinerary): CommuteSummary {
     totalMinutes: secondsToMinutes(totalSeconds(itinerary)),
     transferCount: transferCount(itinerary),
     walkMinutes: secondsToMinutes(walkSeconds(itinerary))
+  };
+}
+
+function buildRouteDetail(
+  itinerary: MappedOtpItinerary,
+  options: {
+    calculatedAt: string;
+    destinationLabel: string;
+    externalDirectionsUrl: string | null;
+    originLabel: string | null;
+  }
+): CommuteRouteDetail {
+  return {
+    calculatedAt: options.calculatedAt,
+    destinationLabel: options.destinationLabel,
+    externalDirectionsUrl: options.externalDirectionsUrl,
+    legs: itinerary.legs.map(mapRouteDetailLeg),
+    originLabel: options.originLabel
+  };
+}
+
+function mapRouteDetailLeg(leg: MappedOtpLeg): CommuteRouteLeg {
+  const display = routeLegDisplay(leg);
+
+  return {
+    color: display.color,
+    dashArray: display.dashArray,
+    distanceMeters: leg.distanceMeters,
+    durationMinutes: secondsToMinutes(leg.durationSeconds),
+    fromName: leg.fromName,
+    geometry: leg.geometry,
+    lineName: leg.routeShortName ?? null,
+    mode: normalizeMode(leg.mode),
+    routeLongName: leg.routeLongName,
+    style: display.style,
+    toName: leg.toName
+  };
+}
+
+function routeLegDisplay(leg: MappedOtpLeg): {
+  color: string;
+  dashArray: string | null;
+  style: CommuteRouteLegStyle;
+} {
+  const mode = normalizeMode(leg.routeMode ?? leg.mode);
+
+  if (WALK_MODES.has(mode)) {
+    return {
+      color: "#6b7280",
+      dashArray: "6 6",
+      style: "walk"
+    };
+  }
+
+  if (BUS_MODES.has(mode) || isBusLeg(leg)) {
+    return {
+      color: "#b45309",
+      dashArray: null,
+      style: "bus"
+    };
+  }
+
+  if (mode === "FERRY") {
+    return {
+      color: "#0f766e",
+      dashArray: null,
+      style: "ferry"
+    };
+  }
+
+  if (mode === "RAIL" || mode === "SUBWAY" || mode === "TRAM") {
+    return {
+      color: "#2563eb",
+      dashArray: null,
+      style: "rail"
+    };
+  }
+
+  return {
+    color: "#2e7d6b",
+    dashArray: null,
+    style: "other"
   };
 }
 
@@ -651,6 +748,64 @@ function normalizeNullableInteger(value: number | null | undefined): number | nu
   }
 
   return Math.max(0, Math.round(value));
+}
+
+export function decodeEncodedPolyline(encoded: string): Array<[number, number]> {
+  const coordinates: Array<[number, number]> = [];
+  let index = 0;
+  let lat = 0;
+  let lng = 0;
+
+  try {
+    while (index < encoded.length) {
+      const latResult = decodePolylineValue(encoded, index);
+      index = latResult.nextIndex;
+      lat += latResult.delta;
+
+      const lngResult = decodePolylineValue(encoded, index);
+      index = lngResult.nextIndex;
+      lng += lngResult.delta;
+
+      const point: [number, number] = [lat / 1e5, lng / 1e5];
+      if (!Number.isFinite(point[0]) || !Number.isFinite(point[1])) {
+        return [];
+      }
+      coordinates.push(point);
+    }
+  } catch {
+    return [];
+  }
+
+  return coordinates;
+}
+
+function decodePolylineValue(
+  encoded: string,
+  startIndex: number
+): {
+  delta: number;
+  nextIndex: number;
+} {
+  let index = startIndex;
+  let result = 0;
+  let shift = 0;
+  let byte = 0;
+
+  do {
+    if (index >= encoded.length) {
+      throw new Error("Malformed encoded polyline.");
+    }
+
+    byte = encoded.charCodeAt(index) - 63;
+    index += 1;
+    result |= (byte & 0x1f) << shift;
+    shift += 5;
+  } while (byte >= 0x20);
+
+  return {
+    delta: result & 1 ? ~(result >> 1) : result >> 1,
+    nextIndex: index
+  };
 }
 
 function getRecord(

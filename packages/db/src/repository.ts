@@ -5,7 +5,13 @@ import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 import { desc, eq } from "drizzle-orm";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { canonicalizeListingUrl, DEFAULT_SEARCH_SETTINGS, type ScoreBreakdown } from "@pamila/core";
+import {
+  canonicalizeListingUrl,
+  DEFAULT_SEARCH_SETTINGS,
+  type CommuteRouteDetail,
+  type CommuteRouteLeg,
+  type ScoreBreakdown
+} from "@pamila/core";
 
 import { runMigrations } from "./migrations.js";
 import {
@@ -459,6 +465,8 @@ export class PamilaDatabase {
         confidence: input.confidence ?? "manual",
         hasBusHeavyRoute: input.hasBusHeavyRoute,
         lineNamesJson: input.lineNames === undefined ? undefined : JSON.stringify(input.lineNames),
+        routeDetailJson:
+          input.routeDetail === undefined ? undefined : JSON.stringify(input.routeDetail),
         routeSummary: input.routeSummary,
         totalMinutes: input.totalMinutes,
         transferCount: input.transferCount,
@@ -476,6 +484,7 @@ export class PamilaDatabase {
       id: randomUUID(),
       lineNamesJson: JSON.stringify(input.lineNames ?? []),
       listingId,
+      routeDetailJson: input.routeDetail === undefined ? null : JSON.stringify(input.routeDetail),
       routeSummary: input.routeSummary ?? null,
       totalMinutes: input.totalMinutes ?? null,
       transferCount: input.transferCount ?? null,
@@ -746,6 +755,7 @@ export class PamilaDatabase {
       id: estimate.id,
       lineNamesJson: JSON.stringify(estimate.lineNames),
       listingId: estimate.listingId,
+      routeDetailJson: estimate.routeDetail ? JSON.stringify(estimate.routeDetail) : null,
       routeSummary: estimate.routeSummary,
       totalMinutes: estimate.totalMinutes,
       transferCount: estimate.transferCount,
@@ -939,6 +949,7 @@ function mapCommuteEstimate(row: CommuteEstimateRow): CommuteEstimateRecord {
     id: row.id,
     lineNames: parseJsonArray<string>(row.lineNamesJson).filter((value): value is string => typeof value === "string"),
     listingId: row.listingId,
+    routeDetail: parseRouteDetail(row.routeDetailJson),
     routeSummary: row.routeSummary,
     totalMinutes: row.totalMinutes,
     transferCount: row.transferCount,
@@ -1017,6 +1028,72 @@ function parseJsonArray<T = unknown>(input: string): T[] {
   } catch {
     return [];
   }
+}
+
+function parseRouteDetail(input: string | null): CommuteRouteDetail | null {
+  if (!input) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(input) as Partial<CommuteRouteDetail> | null;
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.legs)) {
+      return null;
+    }
+
+    return {
+      calculatedAt: typeof parsed.calculatedAt === "string" ? parsed.calculatedAt : "",
+      destinationLabel:
+        typeof parsed.destinationLabel === "string" ? parsed.destinationLabel : "Ramp NYC",
+      externalDirectionsUrl:
+        typeof parsed.externalDirectionsUrl === "string" ? parsed.externalDirectionsUrl : null,
+      legs: parsed.legs.map(normalizeRouteLeg).filter((leg): leg is CommuteRouteLeg => leg !== null),
+      originLabel: typeof parsed.originLabel === "string" ? parsed.originLabel : null
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeRouteLeg(input: unknown): CommuteRouteLeg | null {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+
+  const leg = input as Partial<CommuteRouteLeg>;
+  const mode = typeof leg.mode === "string" ? leg.mode : "UNKNOWN";
+  const style: CommuteRouteLeg["style"] = ["walk", "rail", "bus", "ferry", "other"].includes(
+    String(leg.style)
+  )
+    ? (leg.style as CommuteRouteLeg["style"])
+    : "other";
+
+  return {
+    color: typeof leg.color === "string" ? leg.color : "#2e7d6b",
+    dashArray: typeof leg.dashArray === "string" ? leg.dashArray : null,
+    distanceMeters: typeof leg.distanceMeters === "number" ? leg.distanceMeters : null,
+    durationMinutes: typeof leg.durationMinutes === "number" ? leg.durationMinutes : null,
+    fromName: typeof leg.fromName === "string" ? leg.fromName : null,
+    geometry: Array.isArray(leg.geometry)
+      ? leg.geometry.filter(isRoutePoint).map((point) => [point[0], point[1]] as [number, number])
+      : [],
+    lineName: typeof leg.lineName === "string" ? leg.lineName : null,
+    mode,
+    routeLongName: typeof leg.routeLongName === "string" ? leg.routeLongName : null,
+    style,
+    toName: typeof leg.toName === "string" ? leg.toName : null
+  };
+}
+
+function isRoutePoint(input: unknown): input is [number, number] {
+  return (
+    Array.isArray(input) &&
+    input.length >= 2 &&
+    typeof input[0] === "number" &&
+    Number.isFinite(input[0]) &&
+    typeof input[1] === "number" &&
+    Number.isFinite(input[1])
+  );
 }
 
 function cleanTitle(title: string | null | undefined, source: string) {

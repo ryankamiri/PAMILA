@@ -98,6 +98,7 @@ export const commuteEstimates = sqliteTable("commute_estimates", {
   lineNamesJson: text("line_names_json").notNull(),
   hasBusHeavyRoute: integer("has_bus_heavy_route", { mode: "boolean" }).notNull(),
   confidence: text("confidence").notNull(),
+  routeDetailJson: text("route_detail_json"),
   calculatedAt: text("calculated_at").notNull()
 });
 

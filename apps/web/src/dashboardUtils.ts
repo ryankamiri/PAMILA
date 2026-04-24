@@ -441,6 +441,7 @@ export const createManualListing = (
     bedroomCount: Number.isNaN(parsedBedroomCount) ? null : parsedBedroomCount,
     bedroomLabel: draft.bedroomLabel.trim() || null,
     commute: null,
+    routeDetail: null,
     createdAt: now,
     dateWindow: {
       availabilitySummary: draft.availabilitySummary.trim() || null,

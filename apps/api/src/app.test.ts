@@ -41,6 +41,24 @@ describe("api", () => {
     });
   });
 
+  it("allows local browser dev origins when Vite falls back to another port", async () => {
+    const app = buildApp({ databaseUrl: ":memory:", token });
+
+    const response = await app.inject({
+      headers: {
+        ...authHeaders,
+        origin: "http://127.0.0.1:5174"
+      },
+      method: "GET",
+      url: "/api/settings"
+    });
+
+    await app.close();
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["access-control-allow-origin"]).toBe("http://127.0.0.1:5174");
+  });
+
   it("reads and updates settings", async () => {
     const app = buildApp({ databaseUrl: ":memory:", token });
 
@@ -415,6 +433,7 @@ describe("api", () => {
                       { duration: 300, mode: "WALK" },
                       {
                         duration: 600,
+                        legGeometry: { points: "_p~iF~ps|U_ulLnnqC_mqNvxq`@" },
                         mode: "SUBWAY",
                         route: { longName: "N route", mode: "SUBWAY", shortName: "N" }
                       },
@@ -479,7 +498,10 @@ describe("api", () => {
     expect(calculated.statusCode).toBe(200);
     expect(calculated.json().status).toBe("ok");
     expect(calculated.json().commute.totalMinutes).toBe(18);
+    expect(calculated.json().routeDetail.legs[1].geometry).toHaveLength(3);
+    expect(calculated.json().routeDetail.legs[1].lineName).toBe("N");
     expect(calculated.json().listing.commute.lineNames).toEqual(["N"]);
+    expect(calculated.json().listing.routeDetail.legs[1].style).toBe("rail");
     expect(calculated.json().listing.scoreBreakdown.scoreExplanation).toContain("18 minutes");
   });
 
@@ -543,9 +565,202 @@ describe("api", () => {
     await app.close();
 
     expect(missingLocation.json().status).toBe("missing_location");
+    expect(missingLocation.json().routeDetail).toBeNull();
     expect(otpDown.json().status).toBe("otp_unavailable");
     expect(otpDown.json().commute.totalMinutes).toBe(22);
+    expect(otpDown.json().routeDetail).toBeNull();
     expect(otpDown.json().warnings[0]).toContain("connection refused");
+  });
+
+  it("prepares route with captured approximate location, geocoding, and OTP route detail", async () => {
+    const fetchImpl = vi.fn(async (input: URL | RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("https://geocode.test")) {
+        return new Response(JSON.stringify([{ lat: "40.7465", lon: "-74.0014" }]), { status: 200 });
+      }
+
+      return new Response(
+        JSON.stringify({
+          data: {
+            planConnection: {
+              edges: [
+                {
+                  node: {
+                    duration: 1080,
+                    legs: [
+                      { duration: 300, legGeometry: { points: "_p~iF~ps|U_ulLnnqC_mqNvxq`@" }, mode: "WALK" },
+                      {
+                        duration: 600,
+                        legGeometry: { points: "_p~iF~ps|U_ulLnnqC_mqNvxq`@" },
+                        mode: "SUBWAY",
+                        route: { longName: "N route", mode: "SUBWAY", shortName: "N" }
+                      },
+                      { duration: 180, legGeometry: { points: "_p~iF~ps|U_ulLnnqC_mqNvxq`@" }, mode: "WALK" }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }),
+        { status: 200 }
+      );
+    });
+    const app = buildApp({
+      databaseUrl: ":memory:",
+      fetchImpl,
+      geocoderUrl: "https://geocode.test/search",
+      otpUrl: "https://otp.test/otp/gtfs/v1",
+      token
+    });
+
+    const imported = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      payload: {
+        pageText: "Entire apartment in Chelsea. $3,200 monthly. Studio.",
+        source: "airbnb",
+        thumbnailCandidates: [],
+        title: "Chelsea Airbnb",
+        url: "https://www.airbnb.com/rooms/prepare-success",
+        visibleFields: {}
+      },
+      url: "/api/captures"
+    });
+    const id = imported.json().listing.id;
+
+    const prepared = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/commute/prepare`
+    });
+
+    await app.close();
+
+    expect(prepared.statusCode).toBe(200);
+    expect(prepared.json().status).toBe("ok");
+    expect(prepared.json().nextStep).toBe("review_route");
+    expect(prepared.json().location.lat).toBe(40.7465);
+    expect(prepared.json().routeDetail.legs[1].lineName).toBe("N");
+    expect(prepared.json().warnings).toContain("Route uses approximate location; confirm exact address before final decision.");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("prepares route with clear no-location and geocode no-result blockers", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    const app = buildApp({
+      databaseUrl: ":memory:",
+      fetchImpl,
+      geocoderUrl: "https://geocode.test/search",
+      token
+    });
+
+    const created = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      payload: {
+        source: "leasebreak",
+        sourceUrl: "https://www.leasebreak.com/listing/prepare-blockers",
+        title: "Prepare blockers"
+      },
+      url: "/api/listings"
+    });
+    const id = created.json().listing.id;
+
+    const noLocation = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/commute/prepare`
+    });
+
+    await app.inject({
+      headers: authHeaders,
+      method: "PUT",
+      payload: {
+        confidence: "medium",
+        geographyCategory: "brooklyn",
+        label: "Williamsburg",
+        neighborhood: "Williamsburg",
+        source: "neighborhood"
+      },
+      url: `/api/listings/${id}/location`
+    });
+
+    const noResult = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/commute/prepare`
+    });
+
+    await app.close();
+
+    expect(noLocation.json().status).toBe("missing_location");
+    expect(noLocation.json().nextStep).toBe("add_location");
+    expect(noLocation.json().warnings).toEqual(["No location text was captured yet."]);
+    expect(noResult.json().status).toBe("no_result");
+    expect(noResult.json().nextStep).toBe("enter_coordinates");
+    expect(noResult.json().warnings).toEqual([
+      "Could not find coordinates for this location; enter lat/lng manually."
+    ]);
+  });
+
+  it("prepares route without overwriting manual commute when OTP is unavailable", async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("connection refused"));
+    const app = buildApp({
+      databaseUrl: ":memory:",
+      fetchImpl,
+      otpUrl: "https://otp.test/otp/gtfs/v1",
+      token
+    });
+
+    const created = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      payload: {
+        source: "leasebreak",
+        sourceUrl: "https://www.leasebreak.com/listing/prepare-otp-down",
+        title: "Prepare OTP down"
+      },
+      url: "/api/listings"
+    });
+    const id = created.json().listing.id;
+
+    await app.inject({
+      headers: authHeaders,
+      method: "PUT",
+      payload: {
+        confidence: "exact",
+        geographyCategory: "manhattan",
+        label: "Chelsea",
+        lat: 40.7465,
+        lng: -74.0014,
+        source: "exact_address"
+      },
+      url: `/api/listings/${id}/location`
+    });
+
+    await app.inject({
+      headers: authHeaders,
+      method: "PUT",
+      payload: {
+        routeSummary: "Manual route",
+        totalMinutes: 22
+      },
+      url: `/api/listings/${id}/commute`
+    });
+
+    const prepared = await app.inject({
+      headers: authHeaders,
+      method: "POST",
+      url: `/api/listings/${id}/commute/prepare`
+    });
+
+    await app.close();
+
+    expect(prepared.json().status).toBe("otp_unavailable");
+    expect(prepared.json().nextStep).toBe("manual_commute");
+    expect(prepared.json().commute.totalMinutes).toBe(22);
+    expect(prepared.json().warnings[0]).toBe("OTP is not running; manual commute still works.");
   });
 
   it("returns deterministic capture suggestions when AI is disabled", async () => {

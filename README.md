@@ -72,6 +72,8 @@ Open:
 http://localhost:5173
 ```
 
+If Vite says port `5173` is already busy, open the local URL it prints instead. PAMILA allows loopback browser origins for local development.
+
 The API health endpoint is:
 
 ```text
@@ -97,6 +99,12 @@ Build the extension:
 pnpm --filter @pamila/extension build
 ```
 
+For extension development, keep a compile watcher running:
+
+```sh
+pnpm dev:extension
+```
+
 Load it in Chrome:
 
 1. Open `chrome://extensions`.
@@ -104,10 +112,40 @@ Load it in Chrome:
 3. Click "Load unpacked".
 4. Select `/Users/ramiri/dev/projects/PAMILA/apps/extension`.
 5. Open the extension options page.
-6. Set API URL to `http://127.0.0.1:7410`.
-7. Set token to `dev-local-token` unless you changed `PAMILA_LOCAL_TOKEN`.
+6. Set API URL to `http://localhost:7410`.
+7. Set Local API token to `dev-local-token` unless you changed `PAMILA_LOCAL_TOKEN`.
 
-Use it by opening an Airbnb or Leasebreak listing page and clicking the PAMILA extension button. It captures only the page you are viewing. It does not crawl search results or background-fetch other listing pages.
+The token is the small shared secret the Chrome extension sends to the local API. In the default `.env.example`, the API uses:
+
+```sh
+PAMILA_LOCAL_TOKEN=dev-local-token
+```
+
+So the extension options should use:
+
+```text
+Local API URL: http://localhost:7410
+Local API token: dev-local-token
+```
+
+If you change `PAMILA_LOCAL_TOKEN` in `.env` or your shell, put that exact same value in the extension options page. Leave the OpenAI API key out of the extension; OpenAI keys stay server-side only.
+
+Click "Test connection" on the options page after saving. It should say connected when the local API is running and the token matches. If it says token issue, copy the exact `PAMILA_LOCAL_TOKEN` value into the extension. If it says API offline, start `pnpm dev:api`.
+
+When extension code changes, `pnpm dev:extension` recompiles the `dist/` files automatically, but Chrome still needs the unpacked extension reloaded. Use the "Reload extension" button on the options page or the reload icon on `chrome://extensions`, then refresh any open Airbnb/Leasebreak tabs so the newest content script appears.
+
+Use it from Airbnb or Leasebreak:
+
+1. Open Airbnb or Leasebreak.
+2. Look for the floating PAMILA helper in the lower-right corner.
+3. On search/results pages, use the helper checklist and open one promising listing. PAMILA intentionally does not batch-capture visible search cards.
+4. On a specific listing page, click the compact "Save to PAMILA" button for quick capture.
+5. Use the "PAMILA" pill when you want the full helper panel, API status, troubleshooting, or the dashboard link.
+6. After saving, click "Open Inbox" or open the PAMILA dashboard and check Inbox for cleanup.
+
+The helper appears on `airbnb.com`, `www.airbnb.com`, `leasebreak.com`, and `www.leasebreak.com`. The toolbar extension button still works as a fallback on specific listing pages. It captures only the page you are viewing. It does not crawl search results, background-fetch other listing pages, click filters for you, or inject buttons into every card.
+
+Recommended Airbnb search checklist before opening a listing: NYC/Manhattan area, June 30 or July 1 through September 12, entire place, and around `$3,600` monthly max. For Leasebreak, pay close attention to earliest/latest move-in and move-out windows before saving.
 
 ## Map And Geocoding
 

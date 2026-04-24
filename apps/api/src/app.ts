@@ -20,6 +20,7 @@ import {
   LISTING_STATUSES,
   STAY_TYPES,
   type BedroomFilter,
+  type CommuteRouteDetail,
   type CommuteSummary,
   type ListingLocation,
   type ListingSource,
@@ -223,7 +224,8 @@ export function buildApp(options: BuildAppOptions = {}) {
     }
 
     return {
-      commute: db.getCurrentCommuteEstimate(id)
+      commute: db.getCurrentCommuteEstimate(id),
+      routeDetail: db.getCurrentCommuteEstimate(id)?.routeDetail ?? null
     };
   });
 
@@ -256,6 +258,7 @@ export function buildApp(options: BuildAppOptions = {}) {
         commute: existingCommute,
         externalDirectionsUrl: null,
         listing: listingForResponse(db, listing),
+        routeDetail: null,
         status: "missing_location",
         warnings: ["Add coordinates with geocoding or manual latitude/longitude before OTP routing."]
       } satisfies CalculateCommuteResponse);
@@ -277,25 +280,182 @@ export function buildApp(options: BuildAppOptions = {}) {
         commute: existingCommute,
         externalDirectionsUrl: otpResult.externalDirectionsUrl,
         listing: listingForResponse(db, listing),
+        routeDetail: null,
         status: otpResult.status === "low_confidence_origin" ? "missing_location" : otpResult.status,
         warnings: [otpResult.message, ...otpResult.warnings]
       } satisfies CalculateCommuteResponse);
     }
 
+    const calculatedAt = new Date().toISOString();
+    const routeDetail = {
+      ...otpResult.routeDetail,
+      calculatedAt
+    };
     const commute = db.upsertManualCommuteEstimate(id, {
       ...otpResult.summary,
-      calculatedAt: new Date().toISOString(),
-      confidence: "estimated"
+      calculatedAt,
+      confidence: "estimated",
+      routeDetail
     });
     const refreshedListing = recalculateListing(db, id);
+    const savedRouteDetail = commute?.routeDetail ?? routeDetail;
 
     return reply.send({
       commute,
       externalDirectionsUrl: otpResult.externalDirectionsUrl,
-      listing: refreshedListing,
+      listing: refreshedListing
+        ? {
+            ...refreshedListing,
+            commute,
+            commuteEstimate: commute,
+            lastCommuteCheckedAt: commute?.calculatedAt ?? null,
+            routeDetail: savedRouteDetail
+          }
+        : null,
+      routeDetail: savedRouteDetail,
       status: "ok",
       warnings: otpResult.warnings
     } satisfies CalculateCommuteResponse);
+  });
+
+  app.post("/api/listings/:id/commute/prepare", async (request, reply) => {
+    const id = getRouteId(request.params);
+    const listing = db.getListing(id);
+    if (!listing) {
+      return notFound(reply, "Listing not found.");
+    }
+
+    const warnings: string[] = [];
+    let location: ListingLocation | null = db.getCurrentLocation(id);
+    const existingCommute = db.getCurrentCommuteEstimate(id);
+
+    if (!location) {
+      location = applyBestApproximateLocationFromCaptures(db, listing);
+    }
+
+    if (!location) {
+      return reply.send({
+        commute: existingCommute,
+        listing: listingForResponse(db, listing),
+        location: null,
+        nextStep: "add_location",
+        routeDetail: existingCommute?.routeDetail ?? null,
+        status: "missing_location",
+        warnings: ["No location text was captured yet."]
+      } satisfies PrepareCommuteResponse);
+    }
+
+    if (!hasCoordinates(location)) {
+      const geocoded = await geocodeListingLocation(location, {
+        fetchImpl: options.fetchImpl,
+        geocoderUrl
+      });
+
+      if (geocoded.status !== "ok") {
+        return reply.send({
+          commute: existingCommute,
+          listing: listingForResponse(db, listing),
+          location,
+          nextStep: nextStepForGeocodeStatus(geocoded.status),
+          routeDetail: existingCommute?.routeDetail ?? null,
+          status: geocoded.status === "missing_query" ? "missing_location" : geocoded.status,
+          warnings: prepareGeocodeWarnings(geocoded.status, geocoded.warnings)
+        } satisfies PrepareCommuteResponse);
+      }
+
+      const updatedLocation = db.upsertListingLocation(id, {
+        address: location.address,
+        confidence: location.confidence === "low" ? "medium" : location.confidence,
+        crossStreets: location.crossStreets,
+        geographyCategory: location.geographyCategory,
+        isUserConfirmed: location.isUserConfirmed,
+        label: location.label,
+        lat: geocoded.lat,
+        lng: geocoded.lng,
+        neighborhood: location.neighborhood,
+        source: location.source
+      });
+      location = updatedLocation ?? location;
+    }
+
+    if (!hasCoordinates(location)) {
+      return reply.send({
+        commute: existingCommute,
+        listing: listingForResponse(db, listing),
+        location,
+        nextStep: "enter_coordinates",
+        routeDetail: existingCommute?.routeDetail ?? null,
+        status: "missing_location",
+        warnings: ["Could not find coordinates for this location; enter lat/lng manually."]
+      } satisfies PrepareCommuteResponse);
+    }
+
+    if (isApproximateLocation(location)) {
+      warnings.push("Route uses approximate location; confirm exact address before final decision.");
+    }
+
+    const settings = db.getSettings();
+    const officeDestination =
+      settings.officeLat !== null && settings.officeLng !== null
+        ? { lat: settings.officeLat, lon: settings.officeLng }
+        : null;
+    const otpResult = await requestOtpCommute(location, {
+      endpoint: otpUrl,
+      ...(options.fetchImpl ? { fetcher: options.fetchImpl } : {}),
+      ...(officeDestination ? { destination: officeDestination } : {})
+    });
+
+    if (otpResult.status !== "ok") {
+      const status = otpResult.status === "low_confidence_origin" ? "missing_location" : otpResult.status;
+      return reply.send({
+        commute: existingCommute,
+        externalDirectionsUrl: otpResult.externalDirectionsUrl,
+        listing: listingForResponse(db, listing),
+        location,
+        nextStep: nextStepForOtpStatus(status),
+        routeDetail: existingCommute?.routeDetail ?? null,
+        status,
+        warnings: uniqueStrings([...warnings, prepareOtpWarning(status, otpResult.message), ...otpResult.warnings])
+      } satisfies PrepareCommuteResponse);
+    }
+
+    const calculatedAt = new Date().toISOString();
+    const routeDetail = {
+      ...otpResult.routeDetail,
+      calculatedAt
+    };
+    if (!routeDetail.legs.some((leg) => leg.geometry.length > 1)) {
+      warnings.push("Route steps saved, but no drawable line came back.");
+    }
+
+    const commute = db.upsertManualCommuteEstimate(id, {
+      ...otpResult.summary,
+      calculatedAt,
+      confidence: "estimated",
+      routeDetail
+    });
+    const refreshedListing = recalculateListing(db, id);
+    const savedRouteDetail = commute?.routeDetail ?? routeDetail;
+
+    return reply.send({
+      commute,
+      externalDirectionsUrl: otpResult.externalDirectionsUrl,
+      listing: refreshedListing
+        ? {
+            ...refreshedListing,
+            commute,
+            commuteEstimate: commute,
+            lastCommuteCheckedAt: commute?.calculatedAt ?? null,
+            location,
+            routeDetail: savedRouteDetail
+          }
+        : null,
+      location,
+      nextStep: "review_route",
+      routeDetail: savedRouteDetail,
+      status: "ok",
+      warnings: uniqueStrings([...warnings, ...otpResult.warnings])
+    } satisfies PrepareCommuteResponse);
   });
 
   app.get("/api/listings/:id/captures", async (request, reply) => {
@@ -481,7 +641,8 @@ function listingForResponse(db: PamilaDatabase, listing: ListingWithScore) {
     commute,
     commuteEstimate: commute,
     lastCommuteCheckedAt: commute?.calculatedAt ?? null,
-    location: db.getCurrentLocation(listing.id)
+    location: db.getCurrentLocation(listing.id),
+    routeDetail: commute?.routeDetail ?? null
   };
 }
 
@@ -490,13 +651,42 @@ function corsOriginForRequest(origin: string | undefined, configuredOrigin: stri
     return configuredOrigin;
   }
 
-  const allowedOrigins = new Set([
-    configuredOrigin,
-    configuredOrigin.replace("localhost", "127.0.0.1"),
-    configuredOrigin.replace("127.0.0.1", "localhost")
-  ]);
+  if (isLoopbackBrowserOrigin(origin)) {
+    return origin;
+  }
+
+  const allowedOrigins = new Set([configuredOrigin]);
+  try {
+    const configuredUrl = new URL(configuredOrigin);
+    const hostVariant =
+      configuredUrl.hostname === "localhost"
+        ? "127.0.0.1"
+        : configuredUrl.hostname === "127.0.0.1"
+          ? "localhost"
+          : "";
+
+    if (hostVariant) {
+      configuredUrl.hostname = hostVariant;
+      allowedOrigins.add(configuredUrl.toString().replace(/\/$/, ""));
+    }
+  } catch {
+    // Fall through to the configured origin when the configured value is malformed.
+  }
 
   return allowedOrigins.has(origin) ? origin : configuredOrigin;
+}
+
+function isLoopbackBrowserOrigin(origin: string) {
+  try {
+    const parsed = new URL(origin);
+    return (
+      parsed.protocol === "http:" &&
+      ["localhost", "127.0.0.1", "::1", "[::1]"].includes(parsed.hostname) &&
+      parsed.port !== ""
+    );
+  } catch {
+    return false;
+  }
 }
 
 interface GeocodeListingResponse {
@@ -510,8 +700,36 @@ interface CalculateCommuteResponse {
   status: "ok" | "missing_location" | "otp_unavailable" | "otp_error" | "no_route";
   commute: CommuteSummary | null;
   listing: unknown;
+  routeDetail: CommuteRouteDetail | null;
   warnings: string[];
   externalDirectionsUrl: string | null;
+}
+
+type PrepareCommuteStatus =
+  | "ok"
+  | "missing_location"
+  | "geocoder_unavailable"
+  | "no_result"
+  | "otp_unavailable"
+  | "otp_error"
+  | "no_route";
+
+type PrepareCommuteNextStep =
+  | "add_location"
+  | "enter_coordinates"
+  | "retry_geocode"
+  | "manual_commute"
+  | "review_route";
+
+interface PrepareCommuteResponse {
+  status: PrepareCommuteStatus;
+  location: ListingLocation | null;
+  commute: CommuteSummary | null;
+  listing: unknown;
+  routeDetail: CommuteRouteDetail | null;
+  warnings: string[];
+  nextStep: PrepareCommuteNextStep;
+  externalDirectionsUrl?: string | null;
 }
 
 type GeocodeLocationResult =
@@ -623,6 +841,102 @@ function buildGeocodeQuery(location: ListingLocation) {
   return /new york|nyc|brooklyn|queens/i.test(core) ? core : `${core}, New York, NY`;
 }
 
+function applyBestApproximateLocationFromCaptures(
+  db: PamilaDatabase,
+  listing: ListingWithScore
+): ListingLocation | null {
+  const candidates = db
+    .listCapturesByListing(listing.id)
+    .map((capture) => buildCaptureCleanupSuggestions(capture).locationSuggestion)
+    .filter((location): location is UpsertLocationInput => location !== null)
+    .sort((left, right) => locationConfidenceRank(right.confidence) - locationConfidenceRank(left.confidence));
+
+  const best = candidates[0];
+  if (!best) {
+    return null;
+  }
+
+  return db.upsertListingLocation(listing.id, {
+    ...best,
+    confidence: best.confidence ?? "low",
+    isUserConfirmed: best.isUserConfirmed ?? false
+  });
+}
+
+function locationConfidenceRank(confidence: UpsertLocationInput["confidence"]) {
+  switch (confidence) {
+    case "exact":
+      return 4;
+    case "high":
+      return 3;
+    case "medium":
+      return 2;
+    case "low":
+    case undefined:
+      return 1;
+  }
+}
+
+function prepareGeocodeWarnings(status: GeocodeLocationResult["status"], warnings: string[]) {
+  switch (status) {
+    case "missing_query":
+      return ["No location text was captured yet."];
+    case "no_result":
+      return ["Could not find coordinates for this location; enter lat/lng manually."];
+    case "geocoder_unavailable":
+      return uniqueStrings(["Geocoder is unavailable; enter lat/lng manually or try again.", ...warnings]);
+    case "ok":
+      return warnings;
+  }
+}
+
+function nextStepForGeocodeStatus(status: GeocodeLocationResult["status"]): PrepareCommuteNextStep {
+  switch (status) {
+    case "missing_query":
+      return "add_location";
+    case "no_result":
+      return "enter_coordinates";
+    case "geocoder_unavailable":
+      return "retry_geocode";
+    case "ok":
+      return "review_route";
+  }
+}
+
+function prepareOtpWarning(status: PrepareCommuteStatus, message: string) {
+  switch (status) {
+    case "otp_unavailable":
+      return "OTP is not running; manual commute still works.";
+    case "no_route":
+      return "OTP is running but did not return a transit route.";
+    case "missing_location":
+      return "Could not find coordinates for this location; enter lat/lng manually.";
+    default:
+      return message;
+  }
+}
+
+function nextStepForOtpStatus(status: PrepareCommuteStatus): PrepareCommuteNextStep {
+  switch (status) {
+    case "missing_location":
+      return "enter_coordinates";
+    case "otp_unavailable":
+    case "otp_error":
+    case "no_route":
+      return "manual_commute";
+    default:
+      return "review_route";
+  }
+}
+
+function isApproximateLocation(location: ListingLocation) {
+  return (
+    location.source === "airbnb_approx_pin" ||
+    location.source === "neighborhood" ||
+    location.confidence === "low"
+  );
+}
+
 function parseCoordinate(value: unknown): number | null {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isFinite(parsed) ? parsed : null;
@@ -641,6 +955,10 @@ function isFiniteCoordinatePair(lat: number | null, lng: number | null): boolean
     Number.isFinite(lat) &&
     Number.isFinite(lng)
   );
+}
+
+function uniqueStrings(values: string[]) {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
 
 interface CaptureAnalysisRuntimeOptions {
@@ -908,6 +1226,7 @@ function coerceCommuteUpdate(rawBody: Record<string, unknown>): UpsertCommuteEst
     confidence: commuteConfidenceValue(body.confidence) ?? "manual",
     hasBusHeavyRoute: booleanValue(body.hasBusHeavyRoute),
     lineNames: stringArrayValue(body.lineNames),
+    routeDetail: commuteRouteDetailValue(body.routeDetail),
     routeSummary: nullableStringValue(body.routeSummary),
     totalMinutes: nullableNumberValue(body.totalMinutes),
     transferCount: nullableNumberValue(body.transferCount),
@@ -1126,6 +1445,11 @@ function locationConfidenceValue(input: unknown): UpsertLocationInput["confidenc
 
 function commuteConfidenceValue(input: unknown): UpsertCommuteEstimateInput["confidence"] | undefined {
   return input === "exact" || input === "estimated" || input === "manual" ? input : undefined;
+}
+
+function commuteRouteDetailValue(input: unknown): CommuteRouteDetail | undefined {
+  const object = asObject(input);
+  return Array.isArray(object.legs) ? (object as unknown as CommuteRouteDetail) : undefined;
 }
 
 function stringArrayValue(input: unknown): string[] | undefined {
