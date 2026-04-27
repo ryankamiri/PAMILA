@@ -19,6 +19,7 @@ import {
   LISTING_SOURCES,
   LISTING_STATUSES,
   STAY_TYPES,
+  canonicalizeListingUrl,
   type BedroomFilter,
   type CommuteRouteDetail,
   type CommuteSummary,
@@ -130,6 +131,49 @@ export function buildApp(options: BuildAppOptions = {}) {
     const listing = db.createListing(input.value);
     const scored = recalculateListing(db, listing.id);
     return reply.code(201).send({ listing: scored });
+  });
+
+  app.post("/api/listings/lookup", async (request, reply) => {
+    const input = coerceListingLookup(asObject(request.body));
+    if (!input.ok) {
+      return badRequest(reply, input.message);
+    }
+
+    const matches: Record<string, ListingLookupMatch> = {};
+    for (const url of input.value.urls) {
+      const canonicalUrl = canonicalizeListingUrl(url, input.value.source);
+      const listing = db.getListingByCanonicalUrl(canonicalUrl);
+      if (!listing) {
+        continue;
+      }
+
+      matches[canonicalUrl] = {
+        canonicalUrl,
+        listingId: listing.id,
+        sourceUrl: listing.sourceUrl,
+        status: listing.status,
+        title: listing.title
+      };
+    }
+
+    return reply.send({ matches });
+  });
+
+  app.post("/api/listings/prune-dead-links", async (request, reply) => {
+    const result = await pruneDeadSourceLinks(db, options.fetchImpl ?? globalThis.fetch.bind(globalThis));
+    return reply.send({
+      ...result,
+      listings: db.listListings().map((listing) => listingForResponse(db, listing))
+    } satisfies PruneDeadLinksResponse);
+  });
+
+  app.post("/api/listings/clear-history", async (_request, reply) => {
+    const result = db.clearListingHistory();
+    return reply.send({
+      deletedCount: result.deletedCount,
+      listings: db.listListings().map((listing) => listingForResponse(db, listing)),
+      settings: db.getSettings()
+    } satisfies ClearListingHistoryResponse);
   });
 
   app.get("/api/listings/:id", async (request, reply) => {
@@ -270,6 +314,7 @@ export function buildApp(options: BuildAppOptions = {}) {
         ? { lat: settings.officeLat, lon: settings.officeLng }
         : null;
     const otpResult = await requestOtpCommute(location, {
+      ...(config.otpArrivalDateTime ? { arrivalDateTime: config.otpArrivalDateTime } : {}),
       endpoint: otpUrl,
       ...(options.fetchImpl ? { fetcher: options.fetchImpl } : {}),
       ...(officeDestination ? { destination: officeDestination } : {})
@@ -400,6 +445,7 @@ export function buildApp(options: BuildAppOptions = {}) {
         ? { lat: settings.officeLat, lon: settings.officeLng }
         : null;
     const otpResult = await requestOtpCommute(location, {
+      ...(config.otpArrivalDateTime ? { arrivalDateTime: config.otpArrivalDateTime } : {}),
       endpoint: otpUrl,
       ...(options.fetchImpl ? { fetcher: options.fetchImpl } : {}),
       ...(officeDestination ? { destination: officeDestination } : {})
@@ -543,9 +589,17 @@ export function buildApp(options: BuildAppOptions = {}) {
       return badRequest(reply, input.message);
     }
 
+    const existingListing = db.getListingByCanonicalUrl(canonicalizeListingUrl(input.value.url, input.value.source));
     const imported = db.importCapture(input.value);
     const suggestions = buildCaptureCleanupSuggestions(imported.capture);
-    applyCaptureSuggestions(db, imported.listing, suggestions, input.value.approxLocation);
+    const correctionResult = applyCaptureSuggestions(
+      db,
+      imported.listing,
+      suggestions,
+      input.value.approxLocation,
+      imported.capture,
+      existingListing === null
+    );
     const listing = recalculateListing(db, imported.listing.id);
     const analysis = await maybeAnalyzeCaptureOnImport(db, imported.capture, {
       fetchImpl: options.fetchImpl,
@@ -555,7 +609,9 @@ export function buildApp(options: BuildAppOptions = {}) {
 
     return reply.code(201).send({
       analysis,
+      appliedCorrections: correctionResult.appliedCorrections,
       capture: imported.capture,
+      correctionMode: correctionResult.correctionMode,
       listing,
       suggestions
     });
@@ -705,6 +761,47 @@ interface CalculateCommuteResponse {
   externalDirectionsUrl: string | null;
 }
 
+interface ListingLookupMatch {
+  canonicalUrl: string;
+  listingId: string;
+  sourceUrl: string;
+  status: ListingStatus;
+  title: string;
+}
+
+interface AppliedCaptureCorrection {
+  confidence: "high" | "medium";
+  field: string;
+  nextValue: unknown;
+  previousValue: unknown;
+}
+
+type CaptureCorrectionMode = "created" | "filled_missing" | "auto_fixed" | "no_changes";
+
+interface DeadLinkCheckItem {
+  id: string;
+  reason: string;
+  source: ListingSource;
+  sourceUrl: string;
+  status: number | null;
+  title: string;
+}
+
+interface PruneDeadLinksResponse {
+  checkedCount: number;
+  kept: DeadLinkCheckItem[];
+  listings: unknown[];
+  removed: DeadLinkCheckItem[];
+  removedCount: number;
+  warnings: string[];
+}
+
+interface ClearListingHistoryResponse {
+  deletedCount: number;
+  listings: unknown[];
+  settings: SettingsRecord;
+}
+
 type PrepareCommuteStatus =
   | "ok"
   | "missing_location"
@@ -845,6 +942,7 @@ function applyBestApproximateLocationFromCaptures(
   db: PamilaDatabase,
   listing: ListingWithScore
 ): ListingLocation | null {
+  const currentLocation = db.getCurrentLocation(listing.id);
   const candidates = db
     .listCapturesByListing(listing.id)
     .map((capture) => buildCaptureCleanupSuggestions(capture).locationSuggestion)
@@ -853,7 +951,11 @@ function applyBestApproximateLocationFromCaptures(
 
   const best = candidates[0];
   if (!best) {
-    return null;
+    return currentLocation;
+  }
+
+  if (currentLocation && !shouldApplyCaptureLocation(currentLocation, best, true)) {
+    return currentLocation;
   }
 
   return db.upsertListingLocation(listing.id, {
@@ -971,31 +1073,209 @@ function applyCaptureSuggestions(
   db: PamilaDatabase,
   listing: ListingWithScore,
   suggestions: CaptureCleanupSuggestions,
-  approxLocation: CaptureImportInput["approxLocation"]
-) {
-  const patch = missingOnlyListingPatch(listing, suggestions.suggestedListingUpdate);
+  approxLocation: CaptureImportInput["approxLocation"],
+  capture: CaptureRecord,
+  wasCreated: boolean
+): { appliedCorrections: AppliedCaptureCorrection[]; correctionMode: CaptureCorrectionMode } {
+  const canOverwrite = canAutoFixListing(listing.status);
+  const patch = {
+    ...missingOnlyListingPatch(listing, suggestions.suggestedListingUpdate),
+    ...(canOverwrite ? trustedAutoFixPatch(listing, suggestions.suggestedListingUpdate, capture.visibleFields) : {})
+  };
+  const appliedCorrections = diffListingCorrections(listing, patch, capture.visibleFields);
   if (Object.keys(patch).length > 0) {
     db.updateListing(listing.id, patch);
   }
 
-  if (!db.getCurrentLocation(listing.id)) {
-    if (approxLocation) {
-      db.upsertListingLocation(listing.id, {
-        address: approxLocation.address,
-        confidence: approxLocation.confidence,
-        crossStreets: approxLocation.crossStreets,
-        geographyCategory: approxLocation.geographyCategory,
-        isUserConfirmed: approxLocation.isUserConfirmed,
-        label: approxLocation.label,
-        lat: approxLocation.lat,
-        lng: approxLocation.lng,
-        neighborhood: approxLocation.neighborhood,
-        source: approxLocation.source
-      });
-    } else if (suggestions.locationSuggestion) {
-      db.upsertListingLocation(listing.id, suggestions.locationSuggestion);
+  const currentLocation = db.getCurrentLocation(listing.id);
+  const nextLocation = approxLocation ?? suggestions.locationSuggestion;
+  if (nextLocation && shouldApplyCaptureLocation(currentLocation, nextLocation, canOverwrite)) {
+    const nextLabel = nextLocation.label ?? nextLocation.neighborhood ?? nextLocation.address ?? "Airbnb approximate location";
+    const nextLat = nextLocation.lat ?? null;
+    const nextLng = nextLocation.lng ?? null;
+    db.upsertListingLocation(listing.id, compact({
+      address: nextLocation.address,
+      confidence: nextLocation.confidence,
+      crossStreets: nextLocation.crossStreets,
+      geographyCategory: nextLocation.geographyCategory,
+      isUserConfirmed: nextLocation.isUserConfirmed,
+      label: nextLabel,
+      lat: nextLat,
+      lng: nextLng,
+      neighborhood: nextLocation.neighborhood,
+      source: nextLocation.source
+    }));
+    appliedCorrections.push({
+      confidence: nextLat !== null && nextLng !== null ? "high" : "medium",
+      field: "location",
+      nextValue: nextLabel,
+      previousValue: currentLocation?.label ?? null
+    });
+  }
+
+  return {
+    appliedCorrections,
+    correctionMode: correctionModeForCapture(wasCreated, appliedCorrections)
+  };
+}
+
+function canAutoFixListing(status: ListingStatus) {
+  return ![
+    "contacted",
+    "waiting_for_response",
+    "rejected_by_user",
+    "rejected_by_host",
+    "no_longer_available",
+    "finalist",
+    "chosen"
+  ].includes(status);
+}
+
+function trustedAutoFixPatch(
+  listing: ListingWithScore,
+  suggestions: UpdateListingInput,
+  visibleFields: Record<string, string>
+): UpdateListingInput {
+  const patch: UpdateListingInput = {};
+
+  if (
+    isHighConfidenceField("monthlyRent", visibleFields) &&
+    suggestions.monthlyRent !== undefined &&
+    listing.monthlyRent !== suggestions.monthlyRent
+  ) {
+    patch.monthlyRent = suggestions.monthlyRent;
+  }
+
+  if (isHighConfidenceField("bedroom", visibleFields)) {
+    if (suggestions.bedroomCount !== undefined && listing.bedroomCount !== suggestions.bedroomCount) {
+      patch.bedroomCount = suggestions.bedroomCount;
+    }
+    if (suggestions.bedroomLabel !== undefined && listing.bedroomLabel !== suggestions.bedroomLabel) {
+      patch.bedroomLabel = suggestions.bedroomLabel;
     }
   }
+
+  if (
+    isHighConfidenceField("stayType", visibleFields) &&
+    suggestions.stayType !== undefined &&
+    listing.stayType !== suggestions.stayType
+  ) {
+    patch.stayType = suggestions.stayType;
+  }
+
+  if (
+    isHighConfidenceField("availabilitySummary", visibleFields) &&
+    suggestions.availabilitySummary !== undefined &&
+    listing.availabilitySummary !== suggestions.availabilitySummary
+  ) {
+    patch.availabilitySummary = suggestions.availabilitySummary;
+  }
+
+  return patch;
+}
+
+function isHighConfidenceField(
+  field: "availabilitySummary" | "bedroom" | "monthlyRent" | "stayType",
+  visibleFields: Record<string, string>
+) {
+  if (field === "availabilitySummary") {
+    return Boolean(
+      visibleFields.airbnb_availability_summary ||
+        visibleFields.earliest_move_in_candidate ||
+        visibleFields.latest_move_in_candidate ||
+        visibleFields.earliest_move_out_candidate ||
+        visibleFields.latest_move_out_candidate ||
+        visibleFields.move_in_urgency_candidate
+    );
+  }
+  if (field === "monthlyRent") {
+    return Boolean(visibleFields.airbnb_current_monthly_rent);
+  }
+  if (field === "bedroom") {
+    return Boolean(visibleFields.airbnb_bedroom_count || visibleFields.airbnb_bedroom_summary || visibleFields.leasebreak_bedroom_count);
+  }
+  return Boolean(visibleFields.stay_type_candidate);
+}
+
+function diffListingCorrections(
+  listing: ListingWithScore,
+  patch: UpdateListingInput,
+  visibleFields: Record<string, string>
+): AppliedCaptureCorrection[] {
+  const corrections: AppliedCaptureCorrection[] = [];
+  const add = (field: keyof UpdateListingInput, previousValue: unknown, nextValue: unknown) => {
+    if (nextValue === undefined || previousValue === nextValue) {
+      return;
+    }
+    corrections.push({
+      confidence:
+        (field === "monthlyRent" && isHighConfidenceField("monthlyRent", visibleFields)) ||
+        (field === "availabilitySummary" && isHighConfidenceField("availabilitySummary", visibleFields))
+          ? "high"
+          : field === "bedroomCount" || field === "bedroomLabel"
+            ? "high"
+            : "medium",
+      field: String(field),
+      nextValue,
+      previousValue
+    });
+  };
+
+  add("monthlyRent", listing.monthlyRent, patch.monthlyRent);
+  add("bedroomCount", listing.bedroomCount, patch.bedroomCount);
+  add("bedroomLabel", listing.bedroomLabel, patch.bedroomLabel);
+  add("stayType", listing.stayType, patch.stayType);
+  add("availabilitySummary", listing.availabilitySummary, patch.availabilitySummary);
+  return corrections;
+}
+
+function shouldApplyCaptureLocation(
+  currentLocation: ListingLocation | null,
+  nextLocation: NonNullable<CaptureImportInput["approxLocation"]> | NonNullable<CaptureCleanupSuggestions["locationSuggestion"]>,
+  canOverwrite: boolean
+) {
+  if (!currentLocation) {
+    return true;
+  }
+
+  if (currentLocation.isUserConfirmed || currentLocation.confidence === "exact" || currentLocation.source === "exact_address") {
+    return false;
+  }
+
+  if (!canOverwrite) {
+    return false;
+  }
+
+  const nextLat = nextLocation.lat ?? null;
+  const nextLng = nextLocation.lng ?? null;
+  const nextLabel = nextLocation.label ?? nextLocation.neighborhood ?? nextLocation.address ?? null;
+  const nextHasCoordinates = nextLat !== null && nextLng !== null;
+  const currentHasCoordinates = currentLocation.lat !== null && currentLocation.lng !== null;
+  const currentIsGeneric = /^(new york|new york, united states|airbnb approximate location)$/i.test(currentLocation.label);
+  const nextIsMorePrecise =
+    locationConfidenceRank(nextLocation.confidence) > locationConfidenceRank(currentLocation.confidence) ||
+    nextLocation.source === "exact_address";
+  const labelsDiffer = nextLabel !== null && nextLabel !== currentLocation.label;
+  return (
+    (nextHasCoordinates && !currentHasCoordinates) ||
+    (currentIsGeneric && labelsDiffer) ||
+    (nextIsMorePrecise && labelsDiffer)
+  );
+}
+
+function correctionModeForCapture(
+  wasCreated: boolean,
+  appliedCorrections: AppliedCaptureCorrection[]
+): CaptureCorrectionMode {
+  if (wasCreated) {
+    return "created";
+  }
+  if (appliedCorrections.length === 0) {
+    return "no_changes";
+  }
+  return appliedCorrections.some((correction) => correction.previousValue !== null && correction.previousValue !== "unknown")
+    ? "auto_fixed"
+    : "filled_missing";
 }
 
 function missingOnlyListingPatch(
@@ -1105,8 +1385,189 @@ async function analyzeCaptureForResponse(
   };
 }
 
+async function pruneDeadSourceLinks(
+  db: PamilaDatabase,
+  fetchImpl: typeof fetch
+): Promise<Omit<PruneDeadLinksResponse, "listings">> {
+  const listings = db.listListings();
+  const removed: DeadLinkCheckItem[] = [];
+  const kept: DeadLinkCheckItem[] = [];
+  const warnings: string[] = [];
+
+  for (const listing of listings) {
+    const check = await checkSourceLink(listing, fetchImpl);
+    const item = {
+      id: listing.id,
+      reason: check.reason,
+      source: listing.source,
+      sourceUrl: listing.sourceUrl,
+      status: check.status,
+      title: listing.title
+    } satisfies DeadLinkCheckItem;
+
+    if (check.invalid) {
+      db.deleteListing(listing.id);
+      removed.push(item);
+      continue;
+    }
+
+    kept.push(item);
+    if (check.warning) {
+      warnings.push(`${listing.title}: ${check.warning}`);
+    }
+  }
+
+  return {
+    checkedCount: listings.length,
+    kept,
+    removed,
+    removedCount: removed.length,
+    warnings
+  };
+}
+
+async function checkSourceLink(
+  listing: ListingWithScore,
+  fetchImpl: typeof fetch
+): Promise<{ invalid: boolean; reason: string; status: number | null; warning?: string }> {
+  let url: URL;
+  try {
+    url = new URL(listing.sourceUrl);
+  } catch {
+    return {
+      invalid: false,
+      reason: "invalid_url_format",
+      status: null,
+      warning: "Source URL is not a valid URL, so it was left alone."
+    };
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return {
+      invalid: false,
+      reason: "unsupported_url_protocol",
+      status: null,
+      warning: "Source URL is not HTTP/HTTPS, so it was left alone."
+    };
+  }
+
+  const head = await fetchSourceStatus(fetchImpl, url.toString(), "HEAD");
+  if (head.status === 404 || head.status === 410) {
+    return {
+      invalid: true,
+      reason: head.status === 404 ? "source_returned_404" : "source_returned_410",
+      status: head.status
+    };
+  }
+
+  if (head.status === 405 || head.status === 501) {
+    const get = await fetchSourceStatus(fetchImpl, url.toString(), "GET");
+    if (get.status === 404 || get.status === 410) {
+      return {
+        invalid: true,
+        reason: get.status === 404 ? "source_returned_404" : "source_returned_410",
+        status: get.status
+      };
+    }
+
+    return sourceStatusToKeptResult(get);
+  }
+
+  return sourceStatusToKeptResult(head);
+}
+
+async function fetchSourceStatus(
+  fetchImpl: typeof fetch,
+  url: string,
+  method: "GET" | "HEAD"
+): Promise<{ status: number | null; warning?: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
+
+  try {
+    const response = await fetchImpl(url, {
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "User-Agent": "PAMILA local dead-link checker"
+      },
+      method,
+      redirect: "follow",
+      signal: controller.signal
+    });
+    return { status: response.status };
+  } catch (error) {
+    return {
+      status: null,
+      warning:
+        error instanceof Error && error.name === "AbortError"
+          ? "Dead-link check timed out, so the listing was left alone."
+          : "Dead-link check could not reach the source, so the listing was left alone."
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function sourceStatusToKeptResult(statusResult: {
+  status: number | null;
+  warning?: string;
+}): { invalid: false; reason: string; status: number | null; warning?: string } {
+  const status = statusResult.status;
+
+  if (status === null) {
+    const result = {
+      invalid: false as const,
+      reason: "source_unreachable",
+      status
+    };
+    return statusResult.warning ? { ...result, warning: statusResult.warning } : result;
+  }
+
+  if (status === 401 || status === 403 || status === 429) {
+    return {
+      invalid: false,
+      reason: "source_blocked_check",
+      status,
+      warning: `Source returned ${status}, which may be blocking automated checks; listing was left alone.`
+    };
+  }
+
+  if (status >= 500) {
+    return {
+      invalid: false,
+      reason: "source_server_error",
+      status,
+      warning: `Source returned ${status}; listing was left alone because this may be temporary.`
+    };
+  }
+
+  return {
+    invalid: false,
+    reason: "source_not_dead",
+    status
+  };
+}
+
 function isBlankTitle(title: string) {
   return /^untitled\b/i.test(title.trim());
+}
+
+function coerceListingLookup(body: Record<string, unknown>):
+  | { ok: true; value: { source?: ListingSource; urls: string[] } }
+  | { ok: false; message: string } {
+  if (!Array.isArray(body.urls)) {
+    return { ok: false, message: "urls array is required." };
+  }
+
+  const urls = [...new Set(body.urls.map(stringValue).filter((url): url is string => Boolean(url)))].slice(0, 100);
+  if (urls.length === 0) {
+    return { ok: false, message: "at least one url is required." };
+  }
+
+  return {
+    ok: true,
+    value: isListingSource(body.source) ? { source: body.source, urls } : { urls }
+  };
 }
 
 function coerceCreateListing(body: Record<string, unknown>):

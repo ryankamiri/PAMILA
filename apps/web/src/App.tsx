@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
 import type { DivIcon, LayerGroup, Map as LeafletMap } from "leaflet";
 import "leaflet/dist/leaflet.css";
 
@@ -19,7 +19,8 @@ import type {
   ListingFilters,
   ManualCommuteDraft,
   ManualListingDraft,
-  ManualLocationDraft
+  ManualLocationDraft,
+  RoutePreparationNotice
 } from "./dashboardTypes";
 import {
   applyCaptureSuggestionToListing,
@@ -187,8 +188,25 @@ function getInitialDashboardView(): DashboardView {
     return "daily";
   }
 
-  const hashView = window.location.hash.replace(/^#/, "");
+  const hashView = getDashboardHashPath();
+  if (hashView.startsWith("listing/")) {
+    return "detail";
+  }
+
   return navigationItems.some((item) => item.id === hashView) ? (hashView as DashboardView) : "daily";
+}
+
+function getDashboardHashPath(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  return window.location.hash.replace(/^#\/?/, "");
+}
+
+function getListingIdFromHash(): string | null {
+  const match = /^listing\/([^/?#]+)/.exec(getDashboardHashPath());
+  return match?.[1] ? decodeURIComponent(match[1]) : null;
 }
 
 export function App({ apiClient = defaultApiClient }: AppProps = {}) {
@@ -202,8 +220,12 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
   const [apiState, setApiState] = useState<ApiConnectionState>("loading");
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
+  const [isClearHistoryModalOpen, setIsClearHistoryModalOpen] = useState(false);
+  const [clearHistoryError, setClearHistoryError] = useState<string | null>(null);
   const [onboardingStepIndex, setOnboardingStepIndex] = useState(0);
+  const [routePreparationByListing, setRoutePreparationByListing] = useState<Record<string, RoutePreparationNotice>>({});
   const hasCheckedOnboardingRef = useRef(false);
+  const autoRouteAttemptsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let isMounted = true;
@@ -215,9 +237,17 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
           return;
         }
 
+        const hashListingId = getListingIdFromHash();
+        const linkedListing = hashListingId
+          ? snapshot.listings.find((listing) => listing.id === hashListingId)
+          : null;
+
         setSettings(snapshot.settings);
         setListings(snapshot.listings);
-        setSelectedListingId(snapshot.listings[0]?.id ?? "");
+        setSelectedListingId(linkedListing?.id ?? snapshot.listings[0]?.id ?? "");
+        if (linkedListing) {
+          setActiveView("detail");
+        }
         setFilters((current) => ({
           ...current,
           includeFallback: snapshot.settings.panicModeEnabled,
@@ -237,6 +267,26 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
       isMounted = false;
     };
   }, [apiClient]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const applyHashRoute = () => {
+      const listingId = getListingIdFromHash();
+      if (listingId) {
+        setSelectedListingId(listingId);
+        setActiveView("detail");
+        return;
+      }
+
+      setActiveView(getInitialDashboardView());
+    };
+
+    window.addEventListener("hashchange", applyHashRoute);
+    return () => window.removeEventListener("hashchange", applyHashRoute);
+  }, []);
 
   useEffect(() => {
     if (apiState === "loading" || hasCheckedOnboardingRef.current) {
@@ -573,28 +623,91 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
     }
   };
 
-  const calculateOtpCommute = async (listingId: string) => {
-    setPendingAction("Preparing route...");
+  const calculateOtpCommute = async (
+    listingId: string,
+    options: { automatic?: boolean } = {}
+  ) => {
+    if (!options.automatic) {
+      setPendingAction("Preparing route...");
+    }
 
     try {
       const result = await apiClient.prepareListingCommute(listingId);
       if (result.listing) {
         replaceListing(result.listing);
       }
+      setRoutePreparationByListing((current) => ({
+        ...current,
+        [listingId]: {
+          attemptedAt: new Date().toISOString(),
+          automatic: Boolean(options.automatic),
+          externalDirectionsUrl: result.externalDirectionsUrl,
+          nextStep: result.nextStep,
+          status: result.status,
+          warnings: result.warnings
+        }
+      }));
 
       setApiState("connected");
       setApiNotice(
         result.status === "ok"
-          ? `Saved route through local API.${result.warnings[0] ? ` ${result.warnings[0]}` : ""}`
-          : `Route is not ready: ${result.warnings[0] ?? labelize(result.status)}.`
+          ? `${options.automatic ? "Automatically saved" : "Saved"} route through local API.${
+              result.warnings[0] ? ` ${result.warnings[0]}` : ""
+            }`
+          : `${options.automatic ? "PAMILA tried route calculation automatically" : "Route is not ready"}: ${
+              trimTrailingPeriod(primaryRouteWarning(result.warnings) ?? labelize(result.status))
+            }.`
       );
     } catch {
+      setRoutePreparationByListing((current) => ({
+        ...current,
+        [listingId]: {
+          attemptedAt: new Date().toISOString(),
+          automatic: Boolean(options.automatic),
+          externalDirectionsUrl: null,
+          nextStep: null,
+          status: "api_offline",
+          warnings: ["Local API unavailable; route preparation requires the API."]
+        }
+      }));
       setApiState("offline");
       setApiNotice("Local API unavailable; route preparation requires the API.");
     } finally {
-      setPendingAction(null);
+      if (!options.automatic) {
+        setPendingAction(null);
+      }
     }
   };
+
+  useEffect(() => {
+    if (
+      apiState !== "connected" ||
+      !selectedListing ||
+      selectedListing.routeDetail ||
+      !hasRouteLocationSeed(selectedListing) ||
+      (activeView !== "detail" && activeView !== "commute")
+    ) {
+      return;
+    }
+
+    if (autoRouteAttemptsRef.current.has(selectedListing.id)) {
+      return;
+    }
+
+    autoRouteAttemptsRef.current.add(selectedListing.id);
+    void calculateOtpCommute(selectedListing.id, { automatic: true });
+  }, [
+    activeView,
+    apiState,
+    selectedListing?.id,
+    selectedListing?.location?.address,
+    selectedListing?.location?.crossStreets,
+    selectedListing?.location?.lat,
+    selectedListing?.location?.lng,
+    selectedListing?.location?.label,
+    selectedListing?.location?.neighborhood,
+    selectedListing?.routeDetail
+  ]);
 
   const applyCaptureSuggestion = async (
     listingId: string,
@@ -659,6 +772,57 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
         kind === "csv" ? "text/csv" : "application/json"
       );
       setApiNotice("Local API unavailable; downloaded a dashboard-session export.");
+      setApiState("offline");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const cleanDeadLinks = async () => {
+    setPendingAction("Checking source links...");
+
+    try {
+      const result = await apiClient.pruneDeadLinks();
+      setListings(result.listings);
+      setSelectedListingId((current) =>
+        result.listings.some((listing) => listing.id === current) ? current : result.listings[0]?.id ?? ""
+      );
+      setApiNotice(
+        result.removedCount > 0
+          ? `Removed ${result.removedCount} dead listing${result.removedCount === 1 ? "" : "s"} with 404/410 source links.`
+          : `Checked ${result.checkedCount} source links; no clear 404/410 dead links found.`
+      );
+      setApiState("connected");
+    } catch {
+      setApiNotice("Local API unavailable; dead-link cleanup requires the API.");
+      setApiState("offline");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const clearListingHistory = async () => {
+    setPendingAction("Clearing listing history...");
+    setClearHistoryError(null);
+
+    try {
+      const result = await apiClient.clearListingHistory();
+      setListings(result.listings);
+      setSettings(result.settings);
+      setSelectedListingId(result.listings[0]?.id ?? "");
+      setRoutePreparationByListing({});
+      autoRouteAttemptsRef.current.clear();
+      setActiveView("daily");
+      setApiNotice(
+        `Cleared ${result.deletedCount} listing${result.deletedCount === 1 ? "" : "s"} and associated local history.`
+      );
+      setApiState("connected");
+      setIsClearHistoryModalOpen(false);
+      setClearHistoryError(null);
+    } catch {
+      const message = "Local API unavailable; clearing listing history requires the API.";
+      setClearHistoryError(message);
+      setApiNotice(message);
       setApiState("offline");
     } finally {
       setPendingAction(null);
@@ -736,6 +900,21 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
               <span aria-hidden="true">?</span>
               How PAMILA Works
             </button>
+            <button className="text-button" onClick={() => void cleanDeadLinks()} type="button">
+              <span aria-hidden="true">x</span>
+              Clean dead links
+            </button>
+            <button
+              className="text-button text-button-danger"
+              onClick={() => {
+                setClearHistoryError(null);
+                setIsClearHistoryModalOpen(true);
+              }}
+              type="button"
+            >
+              <span aria-hidden="true">!</span>
+              Clear listing history
+            </button>
             <a className="text-button" href={`http://localhost:${DEFAULT_LOCAL_PORTS.api}/health`}>
               API health
             </a>
@@ -797,6 +976,7 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
             listing={selectedListing}
             onCalculateCommute={calculateOtpCommute}
             onGeocodeLocation={geocodeLocation}
+            routePreparation={routePreparationByListing[selectedListing.id] ?? null}
             onSaveBasics={(listingId, basicsDraft) => {
               const patch = basicsDraftToListingPatch(basicsDraft);
               const current = listings.find((candidate) => candidate.id === listingId);
@@ -827,6 +1007,8 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
               setSelectedListingId(listing.id);
               setActiveView("detail");
             }}
+            routePreparationByListing={routePreparationByListing}
+            selectedListingId={selectedListingId}
             settings={settings}
           />
         ) : null}
@@ -853,7 +1035,121 @@ export function App({ apiClient = defaultApiClient }: AppProps = {}) {
         stepIndex={onboardingStepIndex}
         steps={onboardingSteps}
       />
+      <ClearListingHistoryModal
+        errorMessage={clearHistoryError}
+        isBusy={pendingAction === "Clearing listing history..."}
+        isOpen={isClearHistoryModalOpen}
+        listingCount={listings.length}
+        onCancel={() => {
+          setClearHistoryError(null);
+          setIsClearHistoryModalOpen(false);
+        }}
+        onConfirm={() => void clearListingHistory()}
+      />
     </div>
+  );
+}
+
+export function ClearListingHistoryModal({
+  errorMessage,
+  isBusy,
+  isOpen,
+  listingCount,
+  onCancel,
+  onConfirm
+}: {
+  errorMessage?: string | null | undefined;
+  isBusy?: boolean;
+  isOpen: boolean;
+  listingCount: number;
+  onCancel: () => void;
+  onConfirm: () => void | Promise<void>;
+}) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    dialogRef.current?.focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !isBusy) {
+        onCancel();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isBusy, isOpen, onCancel]);
+
+  if (!isOpen) {
+    return null;
+  }
+
+  return (
+    <ClearListingHistoryDialog
+      dialogRef={dialogRef}
+      errorMessage={errorMessage}
+      isBusy={Boolean(isBusy)}
+      listingCount={listingCount}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
+  );
+}
+
+export function ClearListingHistoryDialog({
+  dialogRef,
+  errorMessage,
+  isBusy,
+  listingCount,
+  onCancel,
+  onConfirm
+}: {
+  dialogRef?: Ref<HTMLDivElement>;
+  errorMessage?: string | null | undefined;
+  isBusy?: boolean;
+  listingCount: number;
+  onCancel: () => void;
+  onConfirm: () => void | Promise<void>;
+}) {
+  return (
+    <>
+      <div className="modal-backdrop" aria-hidden="true" />
+      <div
+        aria-describedby="clear-listing-history-description"
+        aria-labelledby="clear-listing-history-title"
+        aria-modal="true"
+        className="confirmation-dialog"
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
+        <p className="eyebrow">Destructive local action</p>
+        <h3 id="clear-listing-history-title">Clear listing history?</h3>
+        <div className="confirmation-body" id="clear-listing-history-description">
+          <p>
+            This deletes {listingCount} saved listing{listingCount === 1 ? "" : "s"} and associated
+            captures, scores, status history, locations, commutes, media, and AI analysis from the
+            local API database. Settings stay intact.
+          </p>
+          <p>Mock or offline dashboard data will not be cleared. The local API must confirm this action.</p>
+          {errorMessage ? <p className="confirmation-error">{errorMessage}</p> : null}
+        </div>
+        <div className="confirmation-actions">
+          <button className="text-button" disabled={isBusy} onClick={onCancel} type="button">
+            <span aria-hidden="true">x</span>
+            Cancel
+          </button>
+          <button className="danger-button" disabled={isBusy} onClick={onConfirm} type="button">
+            <span aria-hidden="true">!</span>
+            {isBusy ? "Clearing..." : "Clear listing history"}
+          </button>
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -1321,7 +1617,8 @@ function ListingDetailView({
   onSaveBasics,
   onSaveCommute,
   onSaveLocation,
-  onStatusChange
+  onStatusChange,
+  routePreparation
 }: {
   listing: DashboardListing;
   onCalculateCommute: (listingId: string) => void | Promise<void>;
@@ -1330,6 +1627,7 @@ function ListingDetailView({
   onSaveCommute: (listingId: string, draft: ManualCommuteDraft) => void | Promise<void>;
   onSaveLocation: (listingId: string, draft: ManualLocationDraft) => void | Promise<void>;
   onStatusChange: (listingId: string, status: DashboardListing["status"]) => void;
+  routePreparation?: RoutePreparationNotice | null;
 }) {
   const [basicsDraft, setBasicsDraft] = useState(() => listingToBasicsDraft(listing));
   const [commuteDraft, setCommuteDraft] = useState(() => listingToCommuteDraft(listing));
@@ -1415,6 +1713,7 @@ function ListingDetailView({
         <CommuteRoutePanel
           listing={listing}
           onCalculateCommute={onCalculateCommute}
+          routePreparation={routePreparation ?? null}
         />
       </article>
 
@@ -1789,11 +2088,13 @@ function CommuteEditor({
 export function CommuteRoutePanel({
   listing,
   onCalculateCommute,
-  onSelect
+  onSelect,
+  routePreparation
 }: {
   listing: DashboardListing | null;
   onCalculateCommute?: (listingId: string) => void | Promise<void>;
   onSelect?: (listing: DashboardListing) => void;
+  routePreparation?: RoutePreparationNotice | null;
 }) {
   if (!listing) {
     return (
@@ -1837,12 +2138,24 @@ export function CommuteRoutePanel({
         </div>
       </div>
 
-      <RouteReadinessChecklist listing={listing} />
+      <RouteReadinessChecklist listing={listing} routePreparation={routePreparation ?? null} />
 
       {approximateLocation ? (
         <p className="route-warning">
           Route uses approximate location; confirm exact address before final decision.
         </p>
+      ) : null}
+
+      {routePreparation?.warnings.length ? (
+        <div className="route-warning route-warning-stack">
+          <strong>{routePreparation.automatic ? "PAMILA tried automatically." : "Latest route attempt."}</strong>
+          <span>{primaryRouteWarning(routePreparation.warnings) ?? "Route is not ready yet."}</span>
+          {routePreparation.externalDirectionsUrl ? (
+            <a href={routePreparation.externalDirectionsUrl} rel="noreferrer" target="_blank">
+              Open transit directions fallback
+            </a>
+          ) : null}
+        </div>
       ) : null}
 
       <div className="route-metrics" aria-label="Route summary">
@@ -1897,18 +2210,31 @@ export function CommuteRoutePanel({
         </>
       ) : (
         <p className="empty-state">
-          {routeEmptyStateCopy(listing)}
+          {routeEmptyStateCopy(listing, routePreparation)}
         </p>
       )}
     </section>
   );
 }
 
-function RouteReadinessChecklist({ listing }: { listing: DashboardListing }) {
+function RouteReadinessChecklist({
+  listing,
+  routePreparation
+}: {
+  listing: DashboardListing;
+  routePreparation?: RoutePreparationNotice | null;
+}) {
   const hasLocationLabel = Boolean(listing.location?.label?.trim());
   const hasCoordinates = hasListingCoordinates(listing);
-  const routeSaved = Boolean(listing.routeDetail);
-  const otpState = routeSaved ? "Route saved" : hasCoordinates ? "Ready to try OTP" : "Waiting for coordinates";
+  const routePrepared = routePreparation?.status === "ok";
+  const routeSaved = Boolean(listing.routeDetail) || routePrepared;
+  const otpOk = routeSaved || routePreparation?.status === "ok";
+  const otpState = routeOtpState(listing, routePreparation);
+  const routeSavedValue = listing.routeDetail
+    ? `Saved ${formatDateTime(listing.routeDetail.calculatedAt)}`
+    : routePrepared
+      ? "Saved by latest preparation"
+      : "Not saved";
 
   return (
     <div className="route-readiness" aria-label="Route readiness checklist">
@@ -1924,13 +2250,13 @@ function RouteReadinessChecklist({ listing }: { listing: DashboardListing }) {
       />
       <RouteReadinessItem
         label="OTP server status"
-        ok={routeSaved}
+        ok={otpOk}
         value={otpState}
       />
       <RouteReadinessItem
         label="Saved route detail"
         ok={routeSaved}
-        value={routeSaved ? `Saved ${formatDateTime(listing.routeDetail?.calculatedAt ?? null)}` : "Not saved"}
+        value={routeSavedValue}
       />
     </div>
   );
@@ -2148,12 +2474,16 @@ export function MapCommuteView({
   onCalculateCommute,
   onGeocodeLocation,
   onSelect,
+  routePreparationByListing = {},
+  selectedListingId,
   settings
 }: {
   listings: DashboardListing[];
   onCalculateCommute: (listingId: string) => void | Promise<void>;
   onGeocodeLocation: (listingId: string) => void | Promise<void>;
   onSelect: (listing: DashboardListing) => void;
+  routePreparationByListing?: Record<string, RoutePreparationNotice>;
+  selectedListingId?: string;
   settings: DashboardSettings;
 }) {
   const mapElementRef = useRef<HTMLDivElement | null>(null);
@@ -2171,7 +2501,15 @@ export function MapCommuteView({
     () => listings.filter((listing) => listing.location || listing.commute),
     [listings]
   );
+  const selectedRouteCandidate = selectedListingId
+    ? listings.find(
+        (listing) =>
+          listing.id === selectedListingId &&
+          Boolean(listing.location || listing.commute || listing.routeDetail)
+      )
+    : null;
   const defaultRouteListingId =
+    selectedRouteCandidate?.id ??
     listings.find((listing) => listing.routeDetail)?.id ??
     withCoordinates[0]?.id ??
     withCommute[0]?.id ??
@@ -2336,6 +2674,9 @@ export function MapCommuteView({
         listing={selectedRouteListing}
         onCalculateCommute={onCalculateCommute}
         onSelect={onSelect}
+        routePreparation={
+          selectedRouteListing ? routePreparationByListing[selectedRouteListing.id] ?? null : null
+        }
       />
 
       {needsCoordinates.length > 0 ? (
@@ -2800,16 +3141,101 @@ function routeActionLabel(listing: DashboardListing) {
   return "Calculate route with OTP";
 }
 
-function routeEmptyStateCopy(listing: DashboardListing) {
+function routeEmptyStateCopy(
+  listing: DashboardListing,
+  routePreparation?: RoutePreparationNotice | null
+) {
+  if (routePreparation?.status === "ok") {
+    return "Route preparation succeeded; route detail should appear after the listing refresh.";
+  }
+
+  if (routePreparation?.status === "no_result") {
+    return "Geocoding did not find coordinates for this location. Confirm the address, cross streets, or neighborhood.";
+  }
+
+  if (routePreparation?.status === "geocoder_unavailable") {
+    return "The geocoder was unavailable, so PAMILA could not get coordinates for OTP.";
+  }
+
+  if (routePreparation?.status === "missing_location") {
+    return "No usable location was available for routing. Add an address, cross streets, or neighborhood.";
+  }
+
   if (!listing.location) {
     return "No saved route detail yet. Add or accept approximate location first, then prepare the route.";
+  }
+
+  if (routePreparation?.status === "otp_unavailable") {
+    return "Manual commute can still rank this listing, but no drawable route exists because local OTP is not running.";
+  }
+
+  if (routePreparation?.status === "no_route") {
+    return "OTP is running, but it did not return a transit route for this listing.";
+  }
+
+  if (routePreparation?.status === "otp_error") {
+    return "OTP returned an error. Manual commute still works while you debug the local router.";
+  }
+
+  if (routePreparation?.status === "api_offline") {
+    return "The local API was offline during route preparation, so PAMILA could not ask OTP for route details.";
   }
 
   if (!hasListingCoordinates(listing)) {
     return "No saved route detail yet. Geocode this listing, then calculate transit with local OTP.";
   }
 
+  if (listing.commute && !listing.routeDetail) {
+    return "Manual commute is saved and affects ranking, but route steps and a drawable map line require local OTP.";
+  }
+
   return "No saved route detail yet. Calculate this listing with local OTP, or keep using the manual commute fields above.";
+}
+
+function routeOtpState(
+  listing: DashboardListing,
+  routePreparation?: RoutePreparationNotice | null
+) {
+  if (listing.routeDetail) {
+    return "Route saved";
+  }
+
+  if (!listing.location) {
+    return "Needs location";
+  }
+
+  switch (routePreparation?.status) {
+    case "ok":
+      return "Route saved";
+    case "otp_unavailable":
+      return "OTP not running";
+    case "otp_error":
+      return "OTP error";
+    case "no_route":
+      return "No route returned";
+    case "missing_location":
+      return "Needs location";
+    case "geocoder_unavailable":
+      return "Geocoder unavailable";
+    case "no_result":
+      return "No geocode result";
+    case "api_offline":
+      return "API offline";
+    default:
+      return hasListingCoordinates(listing) ? "Will try automatically" : "Waiting for coordinates";
+  }
+}
+
+function primaryRouteWarning(warnings: string[]) {
+  return (
+    warnings.find((warning) => !/approximate|low-confidence/i.test(warning)) ??
+    warnings[0] ??
+    null
+  );
+}
+
+function trimTrailingPeriod(value: string) {
+  return value.replace(/[.。]+$/u, "");
 }
 
 function isApproximateRouteLocation(location: NonNullable<DashboardListing["location"]>) {
@@ -2817,6 +3243,23 @@ function isApproximateRouteLocation(location: NonNullable<DashboardListing["loca
     location.source === "airbnb_approx_pin" ||
     location.source === "neighborhood" ||
     location.confidence === "low"
+  );
+}
+
+function hasRouteLocationSeed(listing: DashboardListing) {
+  const location = listing.location;
+  if (!location) {
+    return false;
+  }
+
+  return (
+    hasListingCoordinates(listing) ||
+    Boolean(
+      location.address?.trim() ||
+        location.crossStreets?.trim() ||
+        location.neighborhood?.trim() ||
+        location.label?.trim()
+    )
   );
 }
 

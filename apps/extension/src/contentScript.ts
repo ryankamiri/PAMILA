@@ -2,6 +2,7 @@ const pamilaContentScriptMarker = "pamila-content-script-ready";
 const captureMessageType = "PAMILA_CAPTURE_CURRENT_PAGE";
 const helperCaptureActiveTabMessageType = "PAMILA_HELPER_CAPTURE_ACTIVE_TAB";
 const helperCheckConnectionMessageType = "PAMILA_HELPER_CHECK_CONNECTION";
+const helperLookupListingsMessageType = "PAMILA_HELPER_LOOKUP_LISTINGS";
 const helperRootId = "pamila-floating-helper-root";
 const helperStorageKey = "pamilaHelperWalkthroughComplete";
 const dashboardUrl = "http://localhost:5173";
@@ -9,11 +10,13 @@ const dashboardInboxUrl = `${dashboardUrl}/#inbox`;
 const defaultPageTextLimit = 12_000;
 const defaultSelectedTextLimit = 4_000;
 const defaultThumbnailLimit = 8;
+let isApplyingAirbnbSavedBadges = false;
 
 type ListingSource = "airbnb" | "leasebreak";
 type HelperPageStatus = "listing_page" | "search_page" | "unsupported_page";
 type ApiConnectionStatus = "connected" | "token_issue" | "api_offline" | "checking";
 type HelperSaveStatus = "idle" | "saving" | "saved" | "error";
+type SavedLookupSource = "api" | "cache";
 
 interface CaptureRequestMessage {
   type: typeof captureMessageType;
@@ -66,6 +69,28 @@ interface HelperState {
   apiStatus: ApiConnectionStatus;
   saveStatus: HelperSaveStatus;
   message: string | null;
+  savedListing: SavedListingSnapshot | null;
+  savedLookupSource: SavedLookupSource | null;
+  searchSavedCardCount: number | null;
+  searchSavedCardMessage: string | null;
+}
+
+interface SavedListingSnapshot {
+  canonicalUrl: string;
+  listingId: string;
+  sourceUrl: string;
+  status: string;
+  title: string;
+  savedAt: string;
+  lastConfirmedAt: string;
+  lookupSource?: SavedLookupSource;
+}
+
+interface SavedListingLookupResult {
+  apiStatus?: ApiConnectionStatus;
+  cacheOnly?: boolean;
+  matchesByUrl?: Record<string, SavedListingSnapshot>;
+  message?: string;
 }
 
 document.documentElement.dataset.pamilaCapture = pamilaContentScriptMarker;
@@ -103,7 +128,11 @@ async function initializePamilaHelper(): Promise<void> {
     walkthroughComplete: await loadWalkthroughCompletion(),
     apiStatus: "checking",
     saveStatus: "idle",
-    message: null
+    message: null,
+    savedListing: null,
+    savedLookupSource: null,
+    searchSavedCardCount: null,
+    searchSavedCardMessage: null
   };
 
   if (!state.walkthroughComplete) {
@@ -135,6 +164,9 @@ async function initializePamilaHelper(): Promise<void> {
 
         await saveCurrentListing(state, render);
       },
+      onRefreshFacts: async () => {
+        await saveCurrentListing(state, render, { refreshExisting: true });
+      },
       onCheckConnection: async () => {
         state.apiStatus = "checking";
         state.message = "Checking PAMILA API...";
@@ -150,6 +182,9 @@ async function initializePamilaHelper(): Promise<void> {
       },
       onOpenDashboard: () => {
         window.open(dashboardUrl, "_blank", "noopener");
+      },
+      onOpenDetails: () => {
+        window.open(dashboardListingUrl(state.savedListing?.listingId ?? null), "_blank", "noopener");
       },
       onOpenInbox: () => {
         window.open(dashboardInboxUrl, "_blank", "noopener");
@@ -171,23 +206,88 @@ async function initializePamilaHelper(): Promise<void> {
   state.apiStatus = normalizeApiStatus(connection?.status);
   state.message = connection?.message ?? null;
   render();
+
+  if (classification.status === "listing_page") {
+    await refreshListingSavedState(classification, state, render);
+  } else if (classification.source === "airbnb" && classification.status === "search_page") {
+    initializeAirbnbSearchBadges(state, render);
+  }
 }
 
-async function saveCurrentListing(state: HelperState, render: () => void): Promise<void> {
+async function saveCurrentListing(
+  state: HelperState,
+  render: () => void,
+  options: { refreshExisting?: boolean } = {}
+): Promise<void> {
+  if (state.savedListing && !options.refreshExisting) {
+    state.isOpen = true;
+    state.message = "This listing is already in PAMILA.";
+    render();
+    return;
+  }
+
   state.saveStatus = "saving";
-  state.message = "Saving this listing to PAMILA...";
+  state.message = options.refreshExisting ? "Refreshing PAMILA facts from this page..." : "Saving this listing to PAMILA...";
   render();
 
-  const response = await sendRuntimeMessage<{ ok: boolean; message: string; apiStatus?: ApiConnectionStatus }>({
+  const response = await sendRuntimeMessage<{
+    ok: boolean;
+    message: string;
+    apiStatus?: ApiConnectionStatus;
+    savedListing?: SavedListingSnapshot;
+  }>({
     type: helperCaptureActiveTabMessageType
   });
 
   state.apiStatus = normalizeApiStatus(response?.apiStatus);
   state.saveStatus = response?.ok ? "saved" : "error";
   state.message = response?.message ?? "PAMILA capture did not return a response.";
+  if (response?.ok && response.savedListing) {
+    state.savedListing = response.savedListing;
+    state.savedLookupSource = response.savedListing.lookupSource ?? "api";
+  }
   if (!response?.ok) {
     state.isOpen = true;
   }
+  render();
+}
+
+async function refreshListingSavedState(
+  classification: HelperPageClassification,
+  state: HelperState,
+  render: () => void
+): Promise<void> {
+  const lookupMessage = classification.source
+    ? {
+        type: helperLookupListingsMessageType,
+        allowAutoSaveCurrentPage: classification.source === "leasebreak",
+        source: classification.source,
+        urls: [window.location.href]
+      }
+    : { type: helperLookupListingsMessageType, urls: [window.location.href] };
+  const response = await sendRuntimeMessage<SavedListingLookupResult>(lookupMessage);
+
+  if (!response) {
+    return;
+  }
+
+  state.apiStatus = normalizeApiStatus(response.apiStatus);
+  const savedListing = response.matchesByUrl?.[window.location.href] ?? Object.values(response.matchesByUrl ?? {})[0] ?? null;
+  if (savedListing) {
+    state.savedListing = savedListing;
+    state.savedLookupSource = savedListing.lookupSource ?? (response.cacheOnly ? "cache" : "api");
+    state.saveStatus = "saved";
+    state.message =
+      state.savedLookupSource === "cache"
+        ? "This listing is already in PAMILA. Showing saved state from local extension cache because the API could not confirm it right now."
+        : "This listing is already in PAMILA.";
+  } else if (state.saveStatus !== "error") {
+    state.savedListing = null;
+    state.savedLookupSource = null;
+    state.saveStatus = "idle";
+    state.message = response.message ?? state.message;
+  }
+
   render();
 }
 
@@ -199,8 +299,10 @@ function renderHelper(
     onToggle: () => void;
     onSave: () => void;
     onQuickSave: () => void;
+    onRefreshFacts: () => void;
     onCheckConnection: () => void;
     onOpenDashboard: () => void;
+    onOpenDetails: () => void;
     onOpenInbox: () => void;
     onDismissWalkthrough: () => void;
   }
@@ -229,6 +331,7 @@ function renderHelper(
       .pamila-toggle,
       .pamila-quick-save,
       .pamila-quick-inbox,
+      .pamila-quick-refresh,
       .pamila-panel,
       .pamila-button,
       .pamila-link {
@@ -255,13 +358,15 @@ function renderHelper(
       .pamila-quick-row {
         align-items: stretch;
         display: flex;
+        flex-wrap: wrap;
         gap: 8px;
         justify-content: flex-end;
         margin-bottom: 8px;
       }
 
       .pamila-quick-save,
-      .pamila-quick-inbox {
+      .pamila-quick-inbox,
+      .pamila-quick-refresh {
         align-items: center;
         border-radius: 8px;
         box-shadow: 0 14px 32px rgba(15, 23, 42, 0.2);
@@ -292,6 +397,13 @@ function renderHelper(
         border: 1px solid #b8d7ce;
         color: #245f52;
         min-width: 92px;
+      }
+
+      .pamila-quick-refresh {
+        background: #eef7f4;
+        border: 1px solid #9ccbc0;
+        color: #1f4f46;
+        min-width: 168px;
       }
 
       .pamila-toggle-dot {
@@ -498,9 +610,9 @@ function renderHelper(
             </div>
             ${state.message ? `<div class="pamila-message" role="status">${escapeHtml(state.message)}</div>` : ""}
             ${state.walkthroughComplete ? "" : renderWalkthroughMarkup()}
-            ${renderGuidanceMarkup(classification.status)}
+            ${renderGuidanceMarkup(classification, state)}
             <div class="pamila-actions">
-              ${renderPrimaryActionMarkup(classification.status, state.saveStatus)}
+              ${renderPrimaryActionMarkup(classification.status, state)}
               <button class="pamila-button pamila-secondary" type="button" data-pamila-action="check">Check API connection</button>
               <button class="pamila-link" type="button" data-pamila-action="dashboard">Open PAMILA dashboard</button>
             </div>
@@ -514,7 +626,11 @@ function renderHelper(
   `;
 
   shadow.querySelector<HTMLButtonElement>('[data-pamila-action="quick-save"]')?.addEventListener("click", handlers.onQuickSave);
+  shadow.querySelectorAll<HTMLButtonElement>('[data-pamila-action="refresh"]').forEach((button) => {
+    button.addEventListener("click", handlers.onRefreshFacts);
+  });
   shadow.querySelector<HTMLButtonElement>('[data-pamila-action="inbox"]')?.addEventListener("click", handlers.onOpenInbox);
+  shadow.querySelector<HTMLButtonElement>('[data-pamila-action="details"]')?.addEventListener("click", handlers.onOpenDetails);
   shadow.querySelector<HTMLButtonElement>(".pamila-toggle")?.addEventListener("click", handlers.onToggle);
   shadow.querySelector<HTMLButtonElement>(".pamila-close")?.addEventListener("click", handlers.onToggle);
   shadow.querySelector<HTMLButtonElement>('[data-pamila-action="save"]')?.addEventListener("click", handlers.onSave);
@@ -534,20 +650,30 @@ function renderQuickSaveMarkup(state: HelperState): string {
       </button>
       ${
         state.saveStatus === "saved"
-          ? `<button class="pamila-quick-inbox" type="button" data-pamila-action="inbox">Open Inbox</button>`
+          ? `<button class="pamila-quick-refresh" type="button" data-pamila-action="refresh">Refresh PAMILA facts</button>
+             <button class="pamila-quick-inbox" type="button" data-pamila-action="inbox">Open Inbox</button>
+             ${
+               state.savedListing?.listingId
+                 ? `<button class="pamila-quick-inbox" type="button" data-pamila-action="details">Open Details</button>`
+                 : ""
+             }`
           : ""
       }
     </div>
   `;
 }
 
-function renderPrimaryActionMarkup(pageStatus: HelperPageStatus, saveStatus: HelperSaveStatus): string {
+function renderPrimaryActionMarkup(pageStatus: HelperPageStatus, state: HelperState): string {
   if (pageStatus !== "listing_page") {
     return `<button class="pamila-button" type="button" disabled>${pageStatus === "search_page" ? "Open a listing first" : "Unsupported page"}</button>`;
   }
 
-  return `<button class="pamila-button" type="button" data-pamila-action="save" ${saveStatus === "saving" ? "disabled" : ""}>${
-    saveStatus === "saving" ? "Saving..." : "Save this listing to PAMILA"
+  if (state.saveStatus === "saved") {
+    return `<button class="pamila-button" type="button" data-pamila-action="refresh">Refresh PAMILA facts</button>`;
+  }
+
+  return `<button class="pamila-button" type="button" data-pamila-action="save" ${state.saveStatus === "saving" ? "disabled" : ""}>${
+    state.saveStatus === "saving" ? "Saving..." : "Save this listing to PAMILA"
   }</button>`;
 }
 
@@ -557,7 +683,7 @@ function getQuickSaveLabel(state: HelperState): string {
   }
 
   if (state.saveStatus === "saved") {
-    return "Saved to PAMILA";
+    return "Already in PAMILA";
   }
 
   if (state.saveStatus === "error") {
@@ -618,8 +744,26 @@ function renderWalkthroughMarkup(): string {
   `;
 }
 
-function renderGuidanceMarkup(pageStatus: HelperPageStatus): string {
-  if (pageStatus === "listing_page") {
+function renderGuidanceMarkup(classification: HelperPageClassification, state: HelperState): string {
+  if (classification.status === "listing_page") {
+    if (state.savedListing) {
+      return `
+        <section>
+          <h3 class="pamila-section-title">Already saved</h3>
+          <ul class="pamila-list">
+            <li>This listing is already in PAMILA.</li>
+            <li>Use Refresh PAMILA facts after ${escapeHtml(getSourceLabel(classification.source))} changes price, bedrooms, dates, or location details.</li>
+            <li>${escapeHtml(state.savedListing.title)} is currently ${escapeHtml(labelize(state.savedListing.status).toLowerCase())}.</li>
+            ${
+              state.savedLookupSource === "cache"
+                ? "<li>Saved state is from local extension cache; start the API to confirm the latest status.</li>"
+                : "<li>PAMILA confirmed this against the local API.</li>"
+            }
+          </ul>
+        </section>
+      `;
+    }
+
     return `
       <section>
         <h3 class="pamila-section-title">Ready to save</h3>
@@ -631,12 +775,26 @@ function renderGuidanceMarkup(pageStatus: HelperPageStatus): string {
     `;
   }
 
-  if (pageStatus === "search_page") {
+  if (classification.status === "search_page") {
+    if (classification.source === "leasebreak") {
+      return `
+        <section>
+          <h3 class="pamila-section-title">Search page guidance</h3>
+          <ul class="pamila-list">
+            <li>Leasebreak search pages are for browsing only; PAMILA will not batch-capture visible cards.</li>
+            <li>Open one specific Leasebreak listing page, then save it from there.</li>
+            <li>Check the listing page date windows before saving: earliest/latest move-in and earliest/latest move-out can change ranking.</li>
+          </ul>
+        </section>
+      `;
+    }
+
     return `
       <section>
         <h3 class="pamila-section-title">Search page guidance</h3>
         <ul class="pamila-list">
           <li>Search pages are noisy, so PAMILA will not batch-capture visible cards.</li>
+          <li>${escapeHtml(state.searchSavedCardMessage ?? "Checking visible cards for listings already in PAMILA...")}</li>
           <li>Open one promising listing page, then save it from there.</li>
           <li>Checklist: NYC/Manhattan, Jun 30 or Jul 1 to Sep 12, entire place, max around $3,600 monthly.</li>
         </ul>
@@ -652,6 +810,18 @@ function renderGuidanceMarkup(pageStatus: HelperPageStatus): string {
       </ul>
     </section>
   `;
+}
+
+function getSourceLabel(source: ListingSource | null): string {
+  if (source === "airbnb") {
+    return "Airbnb";
+  }
+
+  if (source === "leasebreak") {
+    return "Leasebreak";
+  }
+
+  return "the source";
 }
 
 function classifyCurrentHelperPage(url: string): HelperPageClassification {
@@ -691,7 +861,12 @@ function classifyCurrentHelperPage(url: string): HelperPageClassification {
 
 async function sendRuntimeMessage<T>(message: Record<string, unknown>): Promise<T | null> {
   return await new Promise((resolve) => {
+    const timeout = window.setTimeout(() => {
+      resolve(null);
+    }, 15_000);
+
     chrome.runtime.sendMessage(message, (response: T | undefined) => {
+      window.clearTimeout(timeout);
       const error = chrome.runtime.lastError;
       if (error || !response) {
         resolve(null);
@@ -757,6 +932,282 @@ function getApiStatusMessage(status: ApiConnectionStatus): string {
   }
 
   return "Checking PAMILA API...";
+}
+
+function dashboardListingUrl(listingId: string | null): string {
+  return listingId ? `${dashboardUrl}/#listing/${encodeURIComponent(listingId)}` : dashboardInboxUrl;
+}
+
+function labelize(value: string): string {
+  return value
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
+function initializeAirbnbSearchBadges(state: HelperState, render: () => void): void {
+  let debounceTimer: number | null = null;
+  let lookupSerial = 0;
+
+  const scheduleLookup = () => {
+    if (isApplyingAirbnbSavedBadges) {
+      return;
+    }
+
+    if (debounceTimer !== null) {
+      window.clearTimeout(debounceTimer);
+    }
+
+    debounceTimer = window.setTimeout(() => {
+      lookupSerial += 1;
+      const currentSerial = lookupSerial;
+      void lookupAndRenderAirbnbSearchBadges().then((result) => {
+        if (currentSerial !== lookupSerial) {
+          return;
+        }
+
+        state.searchSavedCardCount = result.savedCount;
+        state.searchSavedCardMessage = result.message;
+        render();
+      });
+    }, 300);
+  };
+
+  const observer = new MutationObserver(scheduleLookup);
+  if (document.body) {
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  window.addEventListener("scroll", scheduleLookup, { passive: true });
+  scheduleLookup();
+}
+
+interface AirbnbSearchBadgeResult {
+  message: string;
+  savedCount: number;
+  visibleCount: number;
+}
+
+async function lookupAndRenderAirbnbSearchBadges(): Promise<AirbnbSearchBadgeResult> {
+  const entries = getVisibleAirbnbRoomLinkEntries();
+  const urls = [...new Set(entries.map((entry) => entry.url))].slice(0, 100);
+
+  if (urls.length === 0) {
+    clearAirbnbSavedBadges();
+    return {
+      message: "No visible Airbnb listing cards were detected yet.",
+      savedCount: 0,
+      visibleCount: 0
+    };
+  }
+
+  const response = await sendRuntimeMessage<SavedListingLookupResult>({
+    type: helperLookupListingsMessageType,
+    source: "airbnb",
+    urls
+  });
+
+  if (!response) {
+    return {
+      message: "Could not check visible cards against PAMILA yet.",
+      savedCount: 0,
+      visibleCount: entries.length
+    };
+  }
+
+  const savedCount = renderAirbnbSavedBadges(entries, response.matchesByUrl ?? {});
+  return {
+    message:
+      savedCount > 0
+        ? `${savedCount} visible Airbnb card${savedCount === 1 ? "" : "s"} already in PAMILA. Green badges appear on the saved card photos.`
+        : `Checked ${entries.length} visible Airbnb card${entries.length === 1 ? "" : "s"}; none matched saved PAMILA listings.`,
+    savedCount,
+    visibleCount: entries.length
+  };
+}
+
+interface AirbnbRoomLinkEntry {
+  target: HTMLElement;
+  url: string;
+}
+
+function getVisibleAirbnbRoomLinkEntries(): AirbnbRoomLinkEntry[] {
+  const entriesByUrl = new Map<string, AirbnbRoomLinkEntry & { score: number }>();
+
+  for (const anchor of Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/rooms/"]'))) {
+    const url = normalizeAirbnbRoomUrl(anchor.href);
+    if (!url) {
+      continue;
+    }
+
+    const target = findAirbnbBadgeTarget(anchor);
+    if (!target || !isVisiblyUsefulBadgeTarget(target)) {
+      continue;
+    }
+
+    const score = scoreAirbnbBadgeTarget(anchor, target);
+    const existing = entriesByUrl.get(url);
+    if (!existing || score > existing.score) {
+      entriesByUrl.set(url, { score, target, url });
+    }
+  }
+
+  return Array.from(entriesByUrl.values()).map(({ score: _score, ...entry }) => entry);
+}
+
+function normalizeAirbnbRoomUrl(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl, window.location.href);
+    const roomMatch = /\/rooms\/(\d+)/i.exec(parsed.pathname);
+    return roomMatch?.[1] ? `https://www.airbnb.com/rooms/${roomMatch[1]}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function findAirbnbBadgeTarget(anchor: HTMLAnchorElement): HTMLElement | null {
+  const directMediaTarget = findMediaBadgeTarget(anchor, anchor);
+  if (directMediaTarget) {
+    return directMediaTarget;
+  }
+
+  let current: HTMLElement | null = anchor;
+  for (let depth = 0; depth < 8 && current; depth += 1) {
+    const mediaTarget = findMediaBadgeTarget(current, current);
+    if (mediaTarget) {
+      return mediaTarget;
+    }
+    current = current.parentElement;
+  }
+
+  return anchor;
+}
+
+function findMediaBadgeTarget(root: HTMLElement, boundsRoot: HTMLElement): HTMLElement | null {
+  const image = root.querySelector<HTMLImageElement>("img");
+  if (!image) {
+    return null;
+  }
+
+  const boundsRect = boundsRoot.getBoundingClientRect();
+  let current = image.parentElement;
+  while (current && root.contains(current)) {
+    const rect = current.getBoundingClientRect();
+    if (
+      rect.width >= 120 &&
+      rect.height >= 80 &&
+      rect.width <= Math.max(boundsRect.width + 8, 160) &&
+      rect.height <= Math.max(boundsRect.height * 0.86, 120)
+    ) {
+      return current;
+    }
+
+    current = current.parentElement;
+  }
+
+  return image.parentElement;
+}
+
+function isVisiblyUsefulBadgeTarget(target: HTMLElement): boolean {
+  const rect = target.getBoundingClientRect();
+  return rect.width >= 120 && rect.height >= 80 && rect.bottom >= -200 && rect.top <= window.innerHeight + 800;
+}
+
+function scoreAirbnbBadgeTarget(anchor: HTMLAnchorElement, target: HTMLElement): number {
+  const rect = target.getBoundingClientRect();
+  return (
+    (target.querySelector("img, picture") ? 100 : 0) +
+    (anchor.querySelector("img, picture") ? 50 : 0) +
+    Math.min(rect.width, 400) / 10 +
+    Math.min(rect.height, 320) / 10
+  );
+}
+
+function renderAirbnbSavedBadges(
+  entries: AirbnbRoomLinkEntry[],
+  matchesByUrl: Record<string, SavedListingSnapshot>
+): number {
+  isApplyingAirbnbSavedBadges = true;
+  clearAirbnbSavedBadges();
+  const mountedTargets = new Set<HTMLElement>();
+  let savedCount = 0;
+
+  for (const entry of entries) {
+    const match = matchesByUrl[entry.url];
+    if (!match || mountedTargets.has(entry.target)) {
+      continue;
+    }
+
+    attachAirbnbSavedBadge(entry.target, match);
+    mountedTargets.add(entry.target);
+    savedCount += 1;
+  }
+
+  window.setTimeout(() => {
+    isApplyingAirbnbSavedBadges = false;
+  }, 0);
+
+  return savedCount;
+}
+
+function clearAirbnbSavedBadges(): void {
+  document.querySelectorAll("[data-pamila-card-badge-root='true']").forEach((element) => element.remove());
+}
+
+function attachAirbnbSavedBadge(target: HTMLElement, match: SavedListingSnapshot): void {
+  const host = document.createElement("span");
+  host.dataset.pamilaCardBadgeRoot = "true";
+  host.style.all = "initial";
+  host.style.left = "12px";
+  host.style.pointerEvents = "none";
+  host.style.position = "absolute";
+  host.style.top = "12px";
+  host.style.zIndex = "2147483646";
+
+  const computedPosition = window.getComputedStyle(target).position;
+  if (computedPosition === "static") {
+    target.style.position = "relative";
+  }
+
+  const shadow = host.attachShadow({ mode: "open" });
+  shadow.innerHTML = `
+    <style>
+      .badge {
+        align-items: center;
+        backdrop-filter: blur(10px);
+        background: rgba(255, 255, 255, 0.94);
+        border: 1px solid rgba(22, 101, 52, 0.24);
+        border-radius: 999px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.16);
+        box-sizing: border-box;
+        color: #14532d;
+        display: inline-flex;
+        gap: 6px;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 12px;
+        font-weight: 900;
+        line-height: 1;
+        min-height: 26px;
+        padding: 7px 10px 7px 8px;
+        white-space: nowrap;
+      }
+
+      .dot {
+        background: #16a34a;
+        border-radius: 999px;
+        box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.14);
+        height: 8px;
+        width: 8px;
+      }
+    </style>
+    <span class="badge" title="${escapeHtml(match.title)}"><span class="dot" aria-hidden="true"></span>In PAMILA</span>
+  `;
+
+  target.append(host);
 }
 
 function getHelperPageStatusLabel(status: HelperPageStatus): string {
@@ -832,15 +1283,20 @@ function buildCapturePayload(message: CaptureRequestMessage): CapturePayload {
   const pageText = truncateText(getVisiblePageText(), pageTextLimit);
   const selectedText = truncateText(window.getSelection()?.toString() ?? null, selectedTextLimit);
   const textForParsing = [document.title, selectedText, pageText].filter(Boolean).join(" ");
+  const airbnbCoordinates = source === "airbnb" ? extractCoordinates() : null;
+  const visibleFields = {
+    ...extractVisibleFieldsFromText(source, textForParsing),
+    ...(source === "airbnb" ? extractAirbnbDomVisibleFields(textForParsing, airbnbCoordinates) : {})
+  };
 
   return {
     source,
     url: window.location.href,
     title: truncateText(document.title, 300),
-    visibleFields: extractVisibleFieldsFromText(source, textForParsing),
+    visibleFields,
     selectedText,
     pageText,
-    approxLocation: source === "airbnb" ? extractApproxAirbnbLocation(textForParsing) : null,
+    approxLocation: source === "airbnb" ? extractApproxAirbnbLocation(textForParsing, visibleFields, airbnbCoordinates) : null,
     thumbnailCandidates: extractThumbnailCandidates(thumbnailLimit),
     capturedAt: new Date().toISOString()
   };
@@ -926,11 +1382,12 @@ function extractVisibleFieldsFromText(source: ListingSource, text: string): Reco
     addDateCandidate(fields, normalized, "latest_move_in_candidate", /latest\s+move[-\s]?in\s+date\s*:?\s*([^|]{1,80}?)(?=\s+(?:earliest\s+move[-\s]?out|latest\s+move[-\s]?out|$))/i);
     addDateCandidate(fields, normalized, "earliest_move_out_candidate", /earliest\s+move[-\s]?out\s+date\s*:?\s*([^|]{1,80}?)(?=\s+(?:latest\s+move[-\s]?out|$))/i);
     addDateCandidate(fields, normalized, "latest_move_out_candidate", /latest\s+move[-\s]?out\s+date\s*:?\s*([^|]{1,80})/i);
+    Object.assign(fields, extractLeasebreakSourceFields(normalized));
 
     if (/\bimmediate\b/i.test(normalized)) {
       fields.move_in_urgency_candidate = "immediate";
+    }
   }
-}
 
   if (/\bmonth[-\s]?to[-\s]?month\b/i.test(normalized)) {
     fields.month_to_month_candidate = "yes";
@@ -939,20 +1396,217 @@ function extractVisibleFieldsFromText(source: ListingSource, text: string): Reco
   return fields;
 }
 
-function extractApproxAirbnbLocation(text: string): ListingLocation | null {
-  const coordinates = extractCoordinates();
-  const label = extractAirbnbLocationLabel(text) ?? "Airbnb approximate location";
+function extractAirbnbDomVisibleFields(text: string, coordinates: { lat: number; lng: number } | null): Record<string, string> {
+  return {
+    ...extractAirbnbMonthlyRentFields(text),
+    ...extractAirbnbBedroomFields(text),
+    ...extractAirbnbAvailabilityFields(text),
+    ...extractAirbnbUrlAvailabilityFields(window.location.href),
+    ...extractAirbnbLocationFields(text, coordinates)
+  };
+}
+
+function extractAirbnbMonthlyRentFields(text: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const monthlyPairs = Array.from(
+    normalized.matchAll(
+      /\$([1-9][\d,]{2,})\s*(?:(?:monthly|month|\/\s*month|mo\b)\s+)?\$([1-9][\d,]{2,})\s*(?:monthly|month|\/\s*month|mo\b)/gi
+    )
+  );
+  const pair = monthlyPairs.find((match) => {
+    const original = parseCurrencyAmount(match[1] ?? "");
+    const current = parseCurrencyAmount(match[2] ?? "");
+    return original !== null && current !== null && original > current && current >= 1_000 && current <= 10_000;
+  });
+
+  if (pair?.[1] && pair[2]) {
+    fields.airbnb_original_monthly_rent = `$${pair[1]} monthly`;
+    fields.airbnb_current_monthly_rent = `$${pair[2]} monthly`;
+    fields.monthly_rent_candidate = fields.airbnb_current_monthly_rent;
+    return fields;
+  }
+
+  const monthlyPrice = findFirstMatch(normalized, [
+    /\$[1-9][\d,]{2,}\s*(?:monthly|month|\/\s*month|mo\b)/i,
+    /\$[1-9][\d,]{2,}(?=\s+monthly\b)/i
+  ]);
+  if (monthlyPrice) {
+    fields.airbnb_current_monthly_rent = monthlyPrice;
+    fields.monthly_rent_candidate = monthlyPrice;
+  }
+
+  return fields;
+}
+
+function extractLeasebreakSourceFields(text: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const address = sanitizeFieldValue(
+    text.match(/\b\d{1,5}\s+[A-Z0-9][A-Za-z0-9 .'-]{1,80}?\s(?:st|street|ave|avenue|broadway|blvd|boulevard|rd|road)\b/i)?.[0] ?? null
+  );
+  if (address) {
+    fields.leasebreak_address = address;
+    fields.location_candidate = address;
+  }
+
+  const neighborhood = detectKnownNeighborhood(text);
+  if (neighborhood) {
+    fields.leasebreak_neighborhood = neighborhood;
+    fields.neighborhood_candidate = neighborhood;
+  }
+
+  const bedroomValue = sanitizeFieldValue(
+    text.match(/\bbedrooms?\s*:?\s*(studio|[0-9]+(?:\.[0-9]+)?)(?=\s+(?:bathrooms?|decor|listing\s+type|posted\s+by|\$|earliest|last\s+updated)\b|$)/i)?.[1] ?? null
+  );
+  if (bedroomValue) {
+    fields.leasebreak_bedroom_count = /^studio$/i.test(bedroomValue) ? "0" : bedroomValue;
+    fields.bedroom_candidate = /^studio$/i.test(bedroomValue) ? "Studio" : `${bedroomValue} bedroom`;
+  }
+
+  const listingType = sanitizeFieldValue(
+    text.match(
+      /\blisting\s+type\s*:?\s*([a-z][a-z\s-]{2,60}?)(?=\s+(?:posted\s+by|decor|kind\s+of\s+building|opportunity|brokerage\s+fee|apartment\s+tours|virtual\s+live\s+tours|pre-recorded|features|property\s+details)\b|$)/i
+    )?.[1] ?? null
+  );
+  if (listingType) {
+    fields.leasebreak_listing_type = listingType;
+    const stayType = mapLeasebreakListingTypeToStayType(listingType);
+    if (stayType !== "unknown") {
+      fields.stay_type_candidate = stayType;
+    }
+  }
+
+  return fields;
+}
+
+function extractAirbnbBedroomFields(text: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const summary =
+    findFirstMatch(normalized, [
+      /\b\d+\s+guests?\s*[·•]\s*(?:studio|\d+\s+bedrooms?)\s*[·•]\s*\d+\s+beds?\s*[·•]\s*\d+(?:\.\d+)?\s+baths?\b/i,
+      /\b(?:studio|\d+\s+bedrooms?)\s*[·•]\s*\d+\s+beds?\s*[·•]\s*\d+(?:\.\d+)?\s+baths?\b/i
+    ]) ?? null;
+  const bedroomText = summary ?? normalized;
+  const explicitBedroom = /\b([1-9]\d*)\s+bedrooms?\b/i.exec(bedroomText);
+
+  if (explicitBedroom?.[1]) {
+    fields.airbnb_bedroom_summary = summary ?? explicitBedroom[0];
+    fields.airbnb_bedroom_count = explicitBedroom[1];
+    fields.bedroom_candidate = `${explicitBedroom[1]} bedroom`;
+    return fields;
+  }
+
+  if (/\bstudio\b/i.test(bedroomText) && !/\b\d+\s+bedrooms?\b/i.test(bedroomText)) {
+    fields.airbnb_bedroom_summary = summary ?? "Studio";
+    fields.airbnb_bedroom_count = "0";
+    fields.bedroom_candidate = "Studio";
+  }
+
+  return fields;
+}
+
+function extractAirbnbAvailabilityFields(text: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const monthRange = findFirstMatch(normalized, [
+    /\b(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\.?\s+\d{1,2},\s+\d{4}\s*[-–]\s*(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\.?\s+\d{1,2},\s+\d{4}\b/i
+  ]);
+  if (monthRange) {
+    fields.airbnb_availability_summary = `Available ${monthRange.replace(/\s*[-–]\s*/, " to ")}`;
+    return fields;
+  }
+
+  const checkInOut = normalized.match(
+    /\bcheck-?in\s+(\d{1,2}\/\d{1,2}\/\d{4})\s+check-?out\s+(\d{1,2}\/\d{1,2}\/\d{4})\b/i
+  );
+  if (checkInOut?.[1] && checkInOut[2]) {
+    fields.airbnb_availability_summary = `Available ${checkInOut[1]} to ${checkInOut[2]}`;
+  }
+
+  return fields;
+}
+
+function extractAirbnbUrlAvailabilityFields(url: string): Record<string, string> {
+  try {
+    const parsed = new URL(url);
+    const checkIn = parsed.searchParams.get("check_in") ?? parsed.searchParams.get("checkin");
+    const checkOut = parsed.searchParams.get("check_out") ?? parsed.searchParams.get("checkout");
+    const formattedCheckIn = formatIsoDateForAvailability(checkIn);
+    const formattedCheckOut = formatIsoDateForAvailability(checkOut);
+    if (formattedCheckIn && formattedCheckOut) {
+      return {
+        airbnb_availability_summary: `Available ${formattedCheckIn} to ${formattedCheckOut}`
+      };
+    }
+  } catch {
+    return {};
+  }
+
+  return {};
+}
+
+function formatIsoDateForAvailability(value: string | null): string | null {
+  const match = value?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match?.[1] || !match[2] || !match[3]) {
+    return null;
+  }
+
+  const monthIndex = Number(match[2]) - 1;
+  const day = Number(match[3]);
+  const year = Number(match[1]);
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  if (!Number.isInteger(monthIndex) || monthIndex < 0 || monthIndex > 11 || !Number.isInteger(day) || !Number.isInteger(year)) {
+    return null;
+  }
+
+  return `${months[monthIndex]} ${day}, ${year}`;
+}
+
+function extractAirbnbLocationFields(text: string, coordinates: { lat: number; lng: number } | null): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const label = bestAirbnbLocationLabel(text, coordinates);
+
+  if (label) {
+    fields.airbnb_location_label = label;
+    fields.airbnb_location_confidence = coordinates ? "medium" : "low";
+    fields.airbnb_location_source = coordinates ? "airbnb_map_or_page_state" : "airbnb_visible_text";
+    fields.neighborhood_candidate = label;
+  }
+
+  if (coordinates) {
+    fields.airbnb_approx_lat = String(coordinates.lat);
+    fields.airbnb_approx_lng = String(coordinates.lng);
+    fields.airbnb_location_confidence = "medium";
+    fields.airbnb_location_source = "airbnb_map_or_page_state";
+  }
+
+  return fields;
+}
+
+function parseCurrencyAmount(value: string): number | null {
+  const amount = Number(value.replace(/[^\d]/g, ""));
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function extractApproxAirbnbLocation(
+  text: string,
+  fields: Record<string, string>,
+  coordinates: { lat: number; lng: number } | null
+): ListingLocation | null {
+  const label = bestAirbnbLocationLabel(text, coordinates, fields) ?? "Airbnb approximate location";
 
   if (!coordinates && label === "Airbnb approximate location") {
     return null;
   }
 
+  const neighborhood = label === "Airbnb approximate location" ? null : label;
   return {
     label,
     address: null,
     crossStreets: null,
-    neighborhood: label === "Airbnb approximate location" ? null : label,
-    geographyCategory: "unknown",
+    neighborhood,
+    geographyCategory: geographyForAirbnbLocation(label, neighborhood),
     lat: coordinates?.lat ?? null,
     lng: coordinates?.lng ?? null,
     source: "airbnb_approx_pin",
@@ -967,16 +1621,133 @@ function extractCoordinates(): { lat: number; lng: number } | null {
   const lat = metaLatitude ? Number.parseFloat(metaLatitude) : Number.NaN;
   const lng = metaLongitude ? Number.parseFloat(metaLongitude) : Number.NaN;
 
-  if (Number.isFinite(lat) && Number.isFinite(lng)) {
+  if (isNycCoordinate(lat, lng)) {
     return { lat, lng };
   }
 
   const coordinateMatch = window.location.href.match(/@(-?\d{1,2}\.\d+),(-?\d{1,3}\.\d+)/);
   if (coordinateMatch?.[1] && coordinateMatch[2]) {
-    return {
-      lat: Number.parseFloat(coordinateMatch[1]),
-      lng: Number.parseFloat(coordinateMatch[2])
-    };
+    const urlLat = Number.parseFloat(coordinateMatch[1]);
+    const urlLng = Number.parseFloat(coordinateMatch[2]);
+    if (isNycCoordinate(urlLat, urlLng)) {
+      return {
+        lat: urlLat,
+        lng: urlLng
+      };
+    }
+  }
+
+  for (const candidate of collectCoordinateCandidateText()) {
+    const coordinates = extractCoordinatesFromTextCandidate(candidate);
+    if (coordinates) {
+      return coordinates;
+    }
+  }
+
+  return null;
+}
+
+function collectCoordinateCandidateText(): string[] {
+  const candidates: string[] = [window.location.href];
+
+  for (const element of Array.from(document.querySelectorAll<HTMLElement>("a[href], img[src], source[srcset], iframe[src]")).slice(0, 250)) {
+    const href = element.getAttribute("href");
+    const src = element.getAttribute("src");
+    const srcset = element.getAttribute("srcset");
+    candidates.push(...[href, src, srcset].filter((value): value is string => Boolean(value)));
+  }
+
+  for (const script of Array.from(document.scripts).slice(0, 40)) {
+    const text = script.textContent;
+    if (text && /lat|lng|latitude|longitude|map/i.test(text)) {
+      candidates.push(...extractCoordinateSnippets(text));
+    }
+  }
+
+  return candidates;
+}
+
+function extractCoordinatesFromTextCandidate(value: string): { lat: number; lng: number } | null {
+  const decoded = safeDecodeURIComponent(value);
+  const patterns: Array<{ order: "lat_lng" | "lng_lat"; pattern: RegExp }> = [
+    { order: "lat_lng", pattern: /@(-?\d{1,2}\.\d+),(-?\d{1,3}\.\d+)/ },
+    { order: "lat_lng", pattern: /(?:center|markers|ll)=(-?\d{1,2}\.\d+)%2C(-?\d{1,3}\.\d+)/i },
+    { order: "lat_lng", pattern: /(?:center|markers|ll)=(-?\d{1,2}\.\d+),(-?\d{1,3}\.\d+)/i },
+    {
+      order: "lat_lng",
+      pattern: /["'](?:lat|latitude)["']\s*:\s*(-?\d{1,2}\.\d+)[\s\S]{0,120}?["'](?:lng|lon|longitude)["']\s*:\s*(-?\d{1,3}\.\d+)/i
+    },
+    {
+      order: "lng_lat",
+      pattern: /["'](?:lng|lon|longitude)["']\s*:\s*(-?\d{1,3}\.\d+)[\s\S]{0,120}?["'](?:lat|latitude)["']\s*:\s*(-?\d{1,2}\.\d+)/i
+    }
+  ];
+
+  for (const { order, pattern } of patterns) {
+    const match = decoded.match(pattern);
+    if (!match?.[1] || !match[2]) {
+      continue;
+    }
+
+    const first = Number.parseFloat(match[1]);
+    const second = Number.parseFloat(match[2]);
+    const coordinate = order === "lng_lat" ? { lat: second, lng: first } : { lat: first, lng: second };
+    if (isNycCoordinate(coordinate.lat, coordinate.lng)) {
+      return coordinate;
+    }
+  }
+
+  return null;
+}
+
+function safeDecodeURIComponent(value: string): string {
+  if (!value.includes("%")) {
+    return value;
+  }
+
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function extractCoordinateSnippets(text: string): string[] {
+  const snippets: string[] = [];
+  const pattern = /lat|lng|latitude|longitude|center|markers|ll|map/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) && snippets.length < 12) {
+    const start = Math.max(0, match.index - 800);
+    const end = Math.min(text.length, match.index + 1_200);
+    snippets.push(text.slice(start, end));
+  }
+
+  return snippets;
+}
+
+function isNycCoordinate(lat: number, lng: number): boolean {
+  return Number.isFinite(lat) && Number.isFinite(lng) && lat >= 40.45 && lat <= 40.95 && lng >= -74.35 && lng <= -73.65;
+}
+
+function bestAirbnbLocationLabel(
+  text: string,
+  coordinates: { lat: number; lng: number } | null,
+  fields: Record<string, string> = {}
+): string | null {
+  const explicitFieldLabel = sanitizeFieldValue(fields.airbnb_location_label ?? null);
+  const inferredFromCoordinates = coordinates ? inferNycNeighborhoodFromCoordinates(coordinates.lat, coordinates.lng) : null;
+  const visibleNeighborhood = detectKnownNeighborhood(text);
+  const visibleLabel = extractAirbnbLocationLabel(text);
+  const candidates = [inferredFromCoordinates, visibleNeighborhood, explicitFieldLabel, visibleLabel].filter(
+    (candidate): candidate is string => Boolean(candidate)
+  );
+
+  for (const candidate of candidates) {
+    const sanitized = sanitizeFieldValue(candidate);
+    if (sanitized && !isGenericAirbnbLocationLabel(sanitized)) {
+      return sanitized;
+    }
   }
 
   return null;
@@ -984,11 +1755,128 @@ function extractCoordinates(): { lat: number; lng: number } | null {
 
 function extractAirbnbLocationLabel(text: string): string | null {
   const match =
-    text.match(/where\s+you[’']?ll\s+be\s+([^.,|]{3,80})/i) ??
+    text.match(/where\s+you[’']?ll\s+be\s+([^|]{3,120}?)(?=\s+(?:this listing|guests say|learn more|location is|hosted by|photos|amenities|reviews|reserve)|$)/i) ??
     text.match(/neighborhood\s+([^.,|]{3,80})/i) ??
     text.match(/location\s+([^.,|]{3,80})/i);
+  const label = sanitizeFieldValue(match?.[1] ?? null);
+  if (!label) {
+    return null;
+  }
 
-  return sanitizeFieldValue(match?.[1] ?? null);
+  const neighborhood = detectKnownNeighborhood(label);
+  return neighborhood ?? label.replace(/,\s*United States$/i, "").trim();
+}
+
+function isGenericAirbnbLocationLabel(label: string): boolean {
+  return /^(new york|new york, united states|nyc|united states)$/i.test(label.trim());
+}
+
+function detectKnownNeighborhood(text: string): string | null {
+  const lower = text.toLowerCase();
+  const neighborhoods: Array<[RegExp, string]> = [
+    [/\bupper west side\b|\buws\b/, "Upper West Side"],
+    [/\bupper east side\b|\bues\b/, "Upper East Side"],
+    [/\blong island city\b|\blic\b/, "Long Island City"],
+    [/\bastoria\b/, "Astoria"],
+    [/\bchelsea\b/, "Chelsea"],
+    [/\bflatiron\b/, "Flatiron"],
+    [/\bgramercy\b/, "Gramercy"],
+    [/\bunion square\b/, "Union Square"],
+    [/\bnomad\b/, "NoMad"],
+    [/\bmidtown west\b|\bhell['’]s kitchen\b/, "Midtown West / Hell's Kitchen"],
+    [/\bmidtown\b/, "Midtown"],
+    [/\bmurray hill\b/, "Murray Hill"],
+    [/\bkips bay\b/, "Kips Bay"],
+    [/\beast village\b/, "East Village"],
+    [/\bwest village\b/, "West Village"],
+    [/\bgreenwich village\b/, "Greenwich Village"],
+    [/\bsoho\b/, "SoHo"],
+    [/\btribeca\b/, "Tribeca"],
+    [/\blower east side\b/, "Lower East Side"],
+    [/\bfinancial district\b|\bfidi\b/, "Financial District"],
+    [/\bharlem\b/, "Harlem"],
+    [/\bwilliamsburg\b/, "Williamsburg"],
+    [/\bgreenpoint\b/, "Greenpoint"],
+    [/\bdumbo\b/, "DUMBO"],
+    [/\bbrooklyn heights\b/, "Brooklyn Heights"],
+    [/\bdowntown brooklyn\b/, "Downtown Brooklyn"],
+    [/\bfort greene\b/, "Fort Greene"],
+    [/\bclinton hill\b/, "Clinton Hill"],
+    [/\bpark slope\b/, "Park Slope"],
+    [/\bbushwick\b/, "Bushwick"],
+    [/\bbed-stuy\b|\bbedford-stuyvesant\b/, "Bed-Stuy"]
+  ];
+
+  return neighborhoods.find(([pattern]) => pattern.test(lower))?.[1] ?? null;
+}
+
+function inferNycNeighborhoodFromCoordinates(lat: number, lng: number): string | null {
+  const boxes: Array<{ label: string; minLat: number; maxLat: number; minLng: number; maxLng: number }> = [
+    { label: "Upper West Side", minLat: 40.765, maxLat: 40.805, minLng: -73.995, maxLng: -73.955 },
+    { label: "Upper East Side", minLat: 40.758, maxLat: 40.79, minLng: -73.97, maxLng: -73.935 },
+    { label: "Chelsea", minLat: 40.735, maxLat: 40.755, minLng: -74.01, maxLng: -73.99 },
+    { label: "Flatiron", minLat: 40.735, maxLat: 40.747, minLng: -73.997, maxLng: -73.985 },
+    { label: "Astoria", minLat: 40.755, maxLat: 40.79, minLng: -73.94, maxLng: -73.895 },
+    { label: "Long Island City", minLat: 40.735, maxLat: 40.765, minLng: -73.965, maxLng: -73.925 },
+    { label: "Williamsburg", minLat: 40.7, maxLat: 40.73, minLng: -73.97, maxLng: -73.93 },
+    { label: "Greenpoint", minLat: 40.725, maxLat: 40.745, minLng: -73.965, maxLng: -73.93 }
+  ];
+
+  return boxes.find((box) => lat >= box.minLat && lat <= box.maxLat && lng >= box.minLng && lng <= box.maxLng)?.label ?? null;
+}
+
+function geographyForAirbnbLocation(label: string, neighborhood: string | null): ListingLocation["geographyCategory"] {
+  const lower = `${label} ${neighborhood ?? ""}`.toLowerCase();
+  if (
+    [
+      "chelsea",
+      "flatiron",
+      "gramercy",
+      "union square",
+      "nomad",
+      "midtown",
+      "murray hill",
+      "kips bay",
+      "east village",
+      "west village",
+      "greenwich village",
+      "soho",
+      "tribeca",
+      "lower east side",
+      "financial district",
+      "fidi",
+      "upper east side",
+      "upper west side",
+      "harlem",
+      "manhattan"
+    ].some((candidate) => lower.includes(candidate))
+  ) {
+    return "manhattan";
+  }
+
+  if (["astoria", "long island city", "lic", "queens"].some((candidate) => lower.includes(candidate))) {
+    return "lic_astoria";
+  }
+
+  if (
+    [
+      "williamsburg",
+      "greenpoint",
+      "dumbo",
+      "brooklyn heights",
+      "downtown brooklyn",
+      "fort greene",
+      "clinton hill",
+      "park slope",
+      "bushwick",
+      "bed-stuy",
+      "brooklyn"
+    ].some((candidate) => lower.includes(candidate))
+  ) {
+    return "brooklyn";
+  }
+
+  return "unknown";
 }
 
 function extractThumbnailCandidates(limit: number): ThumbnailCandidate[] {
@@ -1060,6 +1948,24 @@ function inferStayType(text: string): "entire_apartment" | "private_room" | "sha
   }
 
   if (/\bentire\s+(?:rental\s+unit|home|place|apartment|condo|loft|guest\s+suite)\b/i.test(text)) {
+    return "entire_apartment";
+  }
+
+  return "unknown";
+}
+
+function mapLeasebreakListingTypeToStayType(
+  listingType: string
+): "entire_apartment" | "private_room" | "shared_room" | "unknown" {
+  if (/\bshared\s+(?:room|bedroom)\b/i.test(listingType)) {
+    return "shared_room";
+  }
+
+  if (/\b(?:private\s+)?rooms?\b|\brooms?\s+for\s+rent\b/i.test(listingType)) {
+    return "private_room";
+  }
+
+  if (/\b(short\s+term\s+rental|sublet|lease\s+assignment|leasebreak|rental)\b/i.test(listingType)) {
     return "entire_apartment";
   }
 

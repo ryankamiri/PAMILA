@@ -219,6 +219,64 @@ describe("PamilaDatabase", () => {
     expect(restoredCommute?.routeDetail?.legs[1]?.lineName).toBe("F");
     expect(restoredAi?.analysis.hostQuestions).toEqual(["Does July 1 work?"]);
   });
+
+  it("clears listing history while preserving search settings", () => {
+    const db = createInMemoryPamilaDb();
+    const settings = db.updateSettings({ maxMonthlyRent: 4100, panicModeEnabled: true });
+    const listing = db.createListing({
+      monthlyRent: 3200,
+      source: "airbnb",
+      sourceUrl: "https://www.airbnb.com/rooms/clear-me",
+      title: "Clear me"
+    });
+
+    db.importCapture({
+      approxLocation: null,
+      capturedAt: "2026-04-16T12:00:00.000Z",
+      pageHash: "clear-hash",
+      pageText: "Clear this capture",
+      selectedText: null,
+      source: "airbnb",
+      thumbnailCandidates: [],
+      title: "Clear me",
+      url: "https://www.airbnb.com/rooms/clear-me",
+      visibleFields: {}
+    });
+    db.upsertListingLocation(listing.id, {
+      confidence: "high",
+      geographyCategory: "manhattan",
+      isUserConfirmed: true,
+      label: "Chelsea",
+      neighborhood: "Chelsea",
+      source: "neighborhood"
+    });
+    db.upsertManualCommuteEstimate(listing.id, {
+      lineNames: ["F"],
+      totalMinutes: 18
+    });
+    db.saveAiAnalysis({
+      analysis: { summary: "Looks good." },
+      inputHash: "clear-hash",
+      listingId: listing.id,
+      model: "gpt-5"
+    });
+
+    const result = db.clearListingHistory();
+    const backup = db.createBackup();
+    const preservedSettings = db.getSettings();
+
+    db.close();
+
+    expect(result.deletedCount).toBe(1);
+    expect(backup.listings).toEqual([]);
+    expect(backup.captures).toEqual([]);
+    expect(backup.locations).toEqual([]);
+    expect(backup.commuteEstimates).toEqual([]);
+    expect(backup.aiAnalyses).toEqual([]);
+    expect(backup.statusEvents).toEqual([]);
+    expect(preservedSettings.maxMonthlyRent).toBe(settings.maxMonthlyRent);
+    expect(preservedSettings.panicModeEnabled).toBe(true);
+  });
 });
 
 describe("canonicalizeUrlForDb", () => {

@@ -19,13 +19,33 @@
         margin: 16px 0 6px;
       }
 
-      input {
+      input:not([type="checkbox"]) {
         border: 1px solid #cbd5e1;
         border-radius: 6px;
         box-sizing: border-box;
         font: inherit;
         padding: 10px;
         width: 100%;
+      }
+
+      .checkbox-row {
+        align-items: flex-start;
+        display: flex;
+        gap: 10px;
+        margin-top: 18px;
+      }
+
+      .checkbox-row input {
+        flex: 0 0 auto;
+        margin-top: 3px;
+      }
+
+      .checkbox-row label {
+        margin: 0;
+      }
+
+      .checkbox-row .hint {
+        margin-top: 4px;
       }
 
       button {
@@ -74,6 +94,17 @@
 
       <label for="local-token">Local API token</label>
       <input id="local-token" name="local-token" type="password" autocomplete="off" />
+
+      <div class="checkbox-row">
+        <input id="auto-save-leasebreak-listings" name="auto-save-leasebreak-listings" type="checkbox" />
+        <div>
+          <label for="auto-save-leasebreak-listings">Auto-save Leasebreak listings</label>
+          <p class="hint">
+            When enabled, PAMILA may save the Leasebreak listing page you are viewing once after confirming it is not already saved.
+            Airbnb always stays manual.
+          </p>
+        </div>
+      </div>
 
       <button type="submit">Save</button>
       <button class="secondary" id="test-connection" type="button">Test connection</button>

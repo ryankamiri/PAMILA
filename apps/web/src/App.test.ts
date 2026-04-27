@@ -1,9 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { createElement } from "react";
+import { createElement, isValidElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { APP_NAME } from "./appConfig";
-import { App, CommuteRoutePanel, MapCommuteView, OnboardingTour, onboardingSteps } from "./App";
+import {
+  App,
+  ClearListingHistoryDialog,
+  ClearListingHistoryModal,
+  CommuteRoutePanel,
+  MapCommuteView,
+  OnboardingTour,
+  onboardingSteps
+} from "./App";
 import { PamilaApiClient } from "./apiClient";
 import {
   applyCaptureSuggestionToListing,
@@ -121,8 +129,63 @@ describe("web dashboard lane", () => {
     expect(markup).toContain("Export CSV");
     expect(markup).toContain("Backup");
     expect(markup).toContain("How PAMILA Works");
+    expect(markup).toContain("Clean dead links");
+    expect(markup).toContain("Clear listing history");
     expect(markup).toContain("Map/Commute");
     expect(markup).toContain("Manual Add");
+  });
+
+  it("renders clear listing history behind a visible confirmation modal", () => {
+    const closedMarkup = renderToStaticMarkup(
+      createElement(ClearListingHistoryModal, {
+        isOpen: false,
+        listingCount: 3,
+        onCancel: () => undefined,
+        onConfirm: () => undefined
+      })
+    );
+    const openMarkup = renderToStaticMarkup(
+      createElement(ClearListingHistoryModal, {
+        isOpen: true,
+        listingCount: 3,
+        onCancel: () => undefined,
+        onConfirm: () => undefined
+      })
+    );
+
+    expect(closedMarkup).toBe("");
+    expect(openMarkup).toContain("role=\"dialog\"");
+    expect(openMarkup).toContain("Clear listing history?");
+    expect(openMarkup).toContain("This deletes 3 saved listings");
+    expect(openMarkup).toContain("Cancel");
+    expect(openMarkup).toContain("Clear listing history");
+  });
+
+  it("does not clear listing history until the destructive modal confirmation is invoked", () => {
+    let cancelCount = 0;
+    let confirmCount = 0;
+    const tree = ClearListingHistoryDialog({
+      listingCount: 2,
+      onCancel: () => {
+        cancelCount += 1;
+      },
+      onConfirm: () => {
+        confirmCount += 1;
+      }
+    });
+
+    expect(cancelCount).toBe(0);
+    expect(confirmCount).toBe(0);
+
+    const cancelButton = findButtonByText(tree, "Cancel");
+    const confirmButton = findButtonByText(tree, "Clear listing history");
+
+    cancelButton.props.onClick();
+    expect(cancelCount).toBe(1);
+    expect(confirmCount).toBe(0);
+
+    confirmButton.props.onClick();
+    expect(confirmCount).toBe(1);
   });
 
   it("renders the onboarding tour with workflow and troubleshooting copy", () => {
@@ -225,7 +288,63 @@ describe("web dashboard lane", () => {
     expect(needsCoordinatesMarkup).toContain("Geocode then calculate route");
     expect(coordinateMarkup).toContain("Calculate route with OTP");
     expect(coordinateMarkup).toContain("OTP server status");
-    expect(coordinateMarkup).toContain("Ready to try OTP");
+    expect(coordinateMarkup).toContain("Will try automatically");
+
+    const otpUnavailableMarkup = renderToStaticMarkup(
+      createElement(CommuteRoutePanel, {
+        listing: withCoordinates,
+        onCalculateCommute: () => undefined,
+        routePreparation: {
+          attemptedAt: "2026-04-16T12:00:00.000Z",
+          automatic: true,
+          externalDirectionsUrl: "https://maps.example/transit",
+          nextStep: "manual_commute",
+          status: "otp_unavailable",
+          warnings: ["OTP is not running; manual commute still works."]
+        }
+      })
+    );
+
+    expect(otpUnavailableMarkup).toContain("OTP not running");
+    expect(otpUnavailableMarkup).toContain("PAMILA tried automatically.");
+    expect(otpUnavailableMarkup).toContain("Manual commute can still rank this listing");
+    expect(otpUnavailableMarkup).toContain("Open transit directions fallback");
+
+    const noGeocodeResultMarkup = renderToStaticMarkup(
+      createElement(CommuteRoutePanel, {
+        listing: base,
+        onCalculateCommute: () => undefined,
+        routePreparation: {
+          attemptedAt: "2026-04-16T12:00:00.000Z",
+          automatic: false,
+          externalDirectionsUrl: null,
+          nextStep: "enter_coordinates",
+          status: "no_result",
+          warnings: ["Could not find coordinates for this location; enter lat/lng manually."]
+        }
+      })
+    );
+
+    expect(noGeocodeResultMarkup).toContain("No geocode result");
+    expect(noGeocodeResultMarkup).toContain("Geocoding did not find coordinates");
+
+    const preparedButRefreshPendingMarkup = renderToStaticMarkup(
+      createElement(CommuteRoutePanel, {
+        listing: withCoordinates,
+        onCalculateCommute: () => undefined,
+        routePreparation: {
+          attemptedAt: "2026-04-16T12:00:00.000Z",
+          automatic: true,
+          externalDirectionsUrl: null,
+          nextStep: "review_route",
+          status: "ok",
+          warnings: []
+        }
+      })
+    );
+
+    expect(preparedButRefreshPendingMarkup).toContain("Saved by latest preparation");
+    expect(preparedButRefreshPendingMarkup).not.toContain("Not saved");
   });
 
   it("renders saved route details as leg-by-leg commute steps", () => {
@@ -490,6 +609,108 @@ describe("web dashboard lane", () => {
     expect(calls[2]?.[1]?.method).toBe("POST");
   });
 
+  it("calls the dead-link cleanup API route and maps refreshed listings", async () => {
+    const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
+    const apiListing = {
+      availabilitySummary: null,
+      bathroomType: "unknown",
+      bedroomCount: 0,
+      bedroomLabel: "Studio",
+      createdAt: "2026-04-16T00:00:00.000Z",
+      earliestMoveIn: null,
+      earliestMoveOut: null,
+      furnished: "unknown",
+      id: "listing-kept",
+      kitchen: "unknown",
+      latestMoveIn: null,
+      latestMoveOut: null,
+      monthToMonth: false,
+      monthlyRent: 3200,
+      nextAction: null,
+      scoreBreakdown: null,
+      source: "airbnb",
+      sourceUrl: "https://www.airbnb.com/rooms/kept",
+      status: "needs_cleanup",
+      stayType: "entire_apartment",
+      title: "Kept listing",
+      updatedAt: "2026-04-16T00:00:00.000Z",
+      userNotes: null,
+      washer: "unknown"
+    };
+    const fetchMock = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      calls.push([input, init]);
+
+      return {
+        json: async () => ({
+          checkedCount: 2,
+          kept: [],
+          listings: [apiListing],
+          removed: [
+            {
+              id: "listing-dead",
+              reason: "source_returned_404",
+              source: "leasebreak",
+              sourceUrl: "https://www.leasebreak.com/dead",
+              status: 404,
+              title: "Dead listing"
+            }
+          ],
+          removedCount: 1,
+          warnings: []
+        }),
+        ok: true,
+        status: 200,
+        statusText: "OK"
+      } as Response;
+    }) as typeof fetch;
+    const client = new PamilaApiClient({
+      baseUrl: "http://localhost:7410",
+      fetchImpl: fetchMock,
+      token: "local-token"
+    });
+
+    const result = await client.pruneDeadLinks();
+
+    expect(calls[0]?.[0]).toBe("http://localhost:7410/api/listings/prune-dead-links");
+    expect(calls[0]?.[1]?.method).toBe("POST");
+    expect(result.removedCount).toBe(1);
+    expect(result.listings[0]?.id).toBe("listing-kept");
+  });
+
+  it("calls the clear listing history API route and maps the refreshed empty snapshot", async () => {
+    const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
+    const fetchMock = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      calls.push([input, init]);
+
+      return {
+        json: async () => ({
+          deletedCount: 2,
+          listings: [],
+          settings: {
+            ...initialDashboardSnapshot.settings,
+            maxMonthlyRent: 4100
+          }
+        }),
+        ok: true,
+        status: 200,
+        statusText: "OK"
+      } as Response;
+    }) as typeof fetch;
+    const client = new PamilaApiClient({
+      baseUrl: "http://localhost:7410",
+      fetchImpl: fetchMock,
+      token: "local-token"
+    });
+
+    const result = await client.clearListingHistory();
+
+    expect(calls[0]?.[0]).toBe("http://localhost:7410/api/listings/clear-history");
+    expect(calls[0]?.[1]?.method).toBe("POST");
+    expect(result.deletedCount).toBe(2);
+    expect(result.listings).toEqual([]);
+    expect(result.settings.maxMonthlyRent).toBe(4100);
+  });
+
   it("sends settings updates including Panic Mode and AI capture toggles", async () => {
     const calls: Array<[URL | RequestInfo, RequestInit | undefined]> = [];
     const fetchMock = (async (input: URL | RequestInfo, init?: RequestInit) => {
@@ -593,3 +814,78 @@ describe("web dashboard lane", () => {
     expect(draft.lineNames).toContain("N");
   });
 });
+
+function findButtonByText(node: ReactNode, text: string): { props: { onClick: () => void } } {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const result = findButtonByTextOrNull(child, text);
+      if (result) {
+        return result;
+      }
+    }
+  }
+
+  const result = findButtonByTextOrNull(node, text);
+  if (!result) {
+    throw new Error(`Button not found: ${text}`);
+  }
+
+  return result;
+}
+
+function findButtonByTextOrNull(
+  node: ReactNode,
+  text: string
+): { props: { onClick: () => void } } | null {
+  if (node === null || node === undefined || typeof node === "boolean") {
+    return null;
+  }
+
+  if (typeof node === "string" || typeof node === "number" || typeof node === "bigint") {
+    return null;
+  }
+
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const result = findButtonByTextOrNull(child, text);
+      if (result) {
+        return result;
+      }
+    }
+    return null;
+  }
+
+  if (!isValidElement(node)) {
+    return null;
+  }
+
+  const props = node.props as {
+    children?: ReactNode;
+    onClick?: () => void;
+  };
+  if (node.type === "button" && props.onClick && nodeText(props.children).includes(text)) {
+    return { props: { onClick: props.onClick } };
+  }
+
+  return findButtonByTextOrNull(props.children, text);
+}
+
+function nodeText(node: ReactNode): string {
+  if (node === null || node === undefined || typeof node === "boolean") {
+    return "";
+  }
+
+  if (typeof node === "string" || typeof node === "number" || typeof node === "bigint") {
+    return String(node);
+  }
+
+  if (Array.isArray(node)) {
+    return node.map(nodeText).join(" ");
+  }
+
+  if (!isValidElement(node)) {
+    return "";
+  }
+
+  return nodeText((node.props as { children?: ReactNode }).children);
+}

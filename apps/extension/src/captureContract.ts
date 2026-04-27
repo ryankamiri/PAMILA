@@ -5,13 +5,15 @@ export const EXTENSION_DISPLAY_NAME = "PAMILA Capture";
 export const CAPTURE_MESSAGE_TYPE = "PAMILA_CAPTURE_CURRENT_PAGE";
 export const HELPER_CAPTURE_ACTIVE_TAB_MESSAGE_TYPE = "PAMILA_HELPER_CAPTURE_ACTIVE_TAB";
 export const HELPER_CHECK_CONNECTION_MESSAGE_TYPE = "PAMILA_HELPER_CHECK_CONNECTION";
+export const HELPER_LOOKUP_LISTINGS_MESSAGE_TYPE = "PAMILA_HELPER_LOOKUP_LISTINGS";
 
 export const DEFAULT_EXTENSION_SETTINGS = {
   apiBaseUrl: "http://localhost:7410",
   localToken: "dev-local-token",
   pageTextLimit: 12_000,
   selectedTextLimit: 4_000,
-  thumbnailLimit: 8
+  thumbnailLimit: 8,
+  autoSaveLeasebreakListings: false
 } as const;
 
 export interface ExtensionSettings {
@@ -20,6 +22,7 @@ export interface ExtensionSettings {
   pageTextLimit: number;
   selectedTextLimit: number;
   thumbnailLimit: number;
+  autoSaveLeasebreakListings: boolean;
 }
 
 export interface CaptureRequestMessage {
@@ -42,6 +45,40 @@ export interface HelperCheckConnectionMessage {
   type: typeof HELPER_CHECK_CONNECTION_MESSAGE_TYPE;
 }
 
+export interface SavedListingSnapshot {
+  canonicalUrl: string;
+  listingId: string;
+  sourceUrl: string;
+  status: string;
+  title: string;
+  savedAt: string;
+  lastConfirmedAt: string;
+  lookupSource?: "api" | "cache";
+}
+
+export interface SavedListingLookupMessage {
+  type: typeof HELPER_LOOKUP_LISTINGS_MESSAGE_TYPE;
+  allowAutoSaveCurrentPage?: boolean;
+  source?: "airbnb" | "leasebreak";
+  urls: string[];
+}
+
+export interface SavedListingLookupResult {
+  apiStatus: ApiConnectionStatus;
+  cacheOnly: boolean;
+  matchesByUrl: Record<string, SavedListingSnapshot>;
+  message: string;
+}
+
+export interface AppliedCaptureCorrection {
+  confidence: "high" | "medium";
+  field: string;
+  nextValue: unknown;
+  previousValue: unknown;
+}
+
+export type CaptureCorrectionMode = "created" | "filled_missing" | "auto_fixed" | "no_changes";
+
 export type CaptureResponseMessage =
   | {
       ok: true;
@@ -57,6 +94,9 @@ export type HelperCaptureResult =
       ok: true;
       message: string;
       apiStatus: ApiConnectionStatus;
+      appliedCorrections?: AppliedCaptureCorrection[];
+      correctionMode?: CaptureCorrectionMode;
+      savedListing?: SavedListingSnapshot;
     }
   | {
       ok: false;

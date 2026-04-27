@@ -10,7 +10,7 @@ if [ ! -d "$DATA_DIR" ]; then
   exit 1
 fi
 
-docker run -it --rm \
+docker run --rm \
   -p "$PORT:8080" \
   -e JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-"-Xmx4g"}" \
   -v "$(pwd)/$DATA_DIR:/var/opentripplanner" \

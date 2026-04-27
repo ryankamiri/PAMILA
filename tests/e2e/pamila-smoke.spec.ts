@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-const apiBaseUrl = "http://localhost:7410";
+const apiBaseUrl = "http://127.0.0.1:17410";
 const onboardingStorageKey = "pamila:onboarding:v1:completed";
 const token = "dev-local-token";
 const authHeaders = {
@@ -201,6 +201,6 @@ test("manual listing, map pin, and extension-shaped capture flow", async ({ page
   await expect(page.getByLabel("Selected commute route").getByText(listingTitle)).toBeVisible();
 
   await page.getByRole("button", { name: /Inbox/ }).click();
-  await expect(page.getByText(captureTitle)).toBeVisible();
+  await expect(page.locator("article").filter({ hasText: captureTitle }).getByRole("heading", { name: captureTitle }).first()).toBeVisible();
   await expect(page.getByText("Resolve captured uncertainty")).toBeVisible();
 });

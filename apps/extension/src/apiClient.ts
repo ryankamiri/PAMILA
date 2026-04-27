@@ -1,8 +1,40 @@
 import type { CapturePayload } from "@pamila/core";
 
-import type { ApiConnectionResult, ExtensionSettings } from "./captureContract.js";
+import type {
+  ApiConnectionResult,
+  AppliedCaptureCorrection,
+  CaptureCorrectionMode,
+  ExtensionSettings
+} from "./captureContract.js";
 
-export async function postCapturePayload(settings: ExtensionSettings, payload: CapturePayload): Promise<void> {
+export interface ApiSavedListingMatch {
+  canonicalUrl: string;
+  listingId: string;
+  sourceUrl: string;
+  status: string;
+  title: string;
+}
+
+export interface CaptureImportApiResponse {
+  appliedCorrections?: AppliedCaptureCorrection[];
+  correctionMode?: CaptureCorrectionMode;
+  listing: {
+    canonicalSourceUrl?: string;
+    id: string;
+    sourceUrl: string;
+    status: string;
+    title: string;
+  };
+}
+
+export interface SavedListingsLookupApiResponse {
+  matches: Record<string, ApiSavedListingMatch>;
+}
+
+export async function postCapturePayload(
+  settings: ExtensionSettings,
+  payload: CapturePayload
+): Promise<CaptureImportApiResponse> {
   const response = await fetch(`${settings.apiBaseUrl}/api/captures`, {
     method: "POST",
     headers: {
@@ -16,6 +48,30 @@ export async function postCapturePayload(settings: ExtensionSettings, payload: C
     const body = await readResponseBody(response);
     throw new Error(`PAMILA API returned ${response.status}${body ? `: ${body}` : ""}`);
   }
+
+  return (await response.json()) as CaptureImportApiResponse;
+}
+
+export async function lookupSavedListings(
+  settings: ExtensionSettings,
+  urls: string[],
+  source?: "airbnb" | "leasebreak"
+): Promise<SavedListingsLookupApiResponse> {
+  const response = await fetch(`${settings.apiBaseUrl}/api/listings/lookup`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(settings.localToken ? { "X-PAMILA-Token": settings.localToken } : {})
+    },
+    body: JSON.stringify(source ? { source, urls } : { urls })
+  });
+
+  if (!response.ok) {
+    const body = await readResponseBody(response);
+    throw new Error(`PAMILA API returned ${response.status}${body ? `: ${body}` : ""}`);
+  }
+
+  return (await response.json()) as SavedListingsLookupApiResponse;
 }
 
 export async function checkApiConnection(settings: ExtensionSettings): Promise<ApiConnectionResult> {

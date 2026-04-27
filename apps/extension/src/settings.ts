@@ -15,7 +15,11 @@ export function normalizeExtensionSettings(input: Partial<ExtensionSettings> | n
     localToken: rawLocalToken || DEFAULT_EXTENSION_SETTINGS.localToken,
     pageTextLimit: normalizePositiveInteger(input?.pageTextLimit, DEFAULT_EXTENSION_SETTINGS.pageTextLimit),
     selectedTextLimit: normalizePositiveInteger(input?.selectedTextLimit, DEFAULT_EXTENSION_SETTINGS.selectedTextLimit),
-    thumbnailLimit: normalizePositiveInteger(input?.thumbnailLimit, DEFAULT_EXTENSION_SETTINGS.thumbnailLimit)
+    thumbnailLimit: normalizePositiveInteger(input?.thumbnailLimit, DEFAULT_EXTENSION_SETTINGS.thumbnailLimit),
+    autoSaveLeasebreakListings:
+      typeof input?.autoSaveLeasebreakListings === "boolean"
+        ? input.autoSaveLeasebreakListings
+        : DEFAULT_EXTENSION_SETTINGS.autoSaveLeasebreakListings
   };
 }
 

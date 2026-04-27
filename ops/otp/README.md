@@ -35,6 +35,22 @@ data/otp/
 
 ## Data Inputs
 
+You can let PAMILA download the default v1 NYC inputs for you:
+
+```sh
+pnpm otp:download
+```
+
+This is intentionally user-triggered because the OpenStreetMap extract is large. The script skips files that already exist and copies the checked-in OTP config JSON files into `data/otp/`.
+
+Clip the downloaded New York State extract to the NYC area before building:
+
+```sh
+pnpm otp:clip-osm
+```
+
+The clip step keeps the original state extract as `data/otp/new-york-state.osm.pbf.archive` and writes the smaller NYC routing extract to `data/otp/osm.pbf`. The archive suffix matters because OTP will try to read every `.pbf` input in the directory.
+
 ### OpenStreetMap
 
 Use a NYC-area `.osm.pbf` extract and save it as:
@@ -74,7 +90,7 @@ The starter config is deliberately small. It is enough for local graph build exp
 After `data/otp/` contains `osm.pbf`, GTFS ZIP files, and config JSON:
 
 ```sh
-sh ops/otp/scripts/build-graph.sh
+pnpm otp:build
 ```
 
 The script runs the OTP container with `--build --save`. It does not download data.
@@ -84,7 +100,7 @@ The script runs the OTP container with `--build --save`. It does not download da
 Serve the saved graph locally:
 
 ```sh
-sh ops/otp/scripts/run-server.sh
+pnpm otp:run
 ```
 
 Default port:
@@ -104,7 +120,7 @@ http://127.0.0.1:8080/graphiql
 With OTP running:
 
 ```sh
-sh ops/otp/scripts/check-health.sh
+pnpm otp:health
 ```
 
 This checks the local OTP HTTP endpoint only. It does not prove the graph has every desired route, but it catches the common "server is not up" case.
@@ -114,7 +130,7 @@ This checks the local OTP HTTP endpoint only. It does not prove the graph has ev
 PAMILA's adapter defaults to:
 
 - destination: Ramp NYC, 28 West 23rd Street
-- arrival time: July 1, 2026 at 9:00 AM Eastern
+- arrival time: May 6, 2026 at 9:00 AM Eastern by default, used as a representative Wednesday commute because current MTA static feeds may not yet include the internship dates
 - modes: walking access/egress plus subway/rail/bus transit
 - endpoint: `http://127.0.0.1:8080/otp/gtfs/v1`
 
@@ -123,6 +139,6 @@ The API integration layer can override destination coordinates from settings onc
 ## Troubleshooting
 
 - If graph build fails immediately, confirm the GTFS ZIP filenames include `gtfs`.
-- If Docker runs out of memory, raise Docker Desktop's memory limit and set `JAVA_TOOL_OPTIONS`, for example `JAVA_TOOL_OPTIONS=-Xmx6g`.
+- If Docker runs out of memory, keep `pnpm otp:clip-osm` in the setup path and raise Docker Desktop's memory limit if needed. You can also override the Java heap, for example `JAVA_TOOL_OPTIONS=-Xmx4g pnpm otp:build`.
 - If `/graphiql` works but PAMILA route requests fail, inspect the generated GraphQL query in the adapter test fixtures and compare it with OTP's live schema in GraphiQL.
 - If OTP is unavailable, PAMILA should keep manual commute entry usable and scoreable.

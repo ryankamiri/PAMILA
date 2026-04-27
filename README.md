@@ -49,6 +49,7 @@ PAMILA_LOCAL_TOKEN=dev-local-token
 VITE_PAMILA_LOCAL_TOKEN=dev-local-token
 PAMILA_DATABASE_URL=file:data/pamila.sqlite
 PAMILA_OTP_URL=http://127.0.0.1:8080/otp/gtfs/v1
+PAMILA_OTP_ARRIVAL_DATE_TIME=2026-05-06T09:00:00-04:00
 PAMILA_GEOCODER_URL=https://nominatim.openstreetmap.org/search
 OPENAI_API_KEY=
 PAMILA_OPENAI_MODEL=gpt-5
@@ -79,6 +80,14 @@ The API health endpoint is:
 ```text
 http://127.0.0.1:7410/health
 ```
+
+After OTP has been downloaded and built once, you can run the API, web app, and OTP together:
+
+```sh
+pnpm dev:all
+```
+
+That command starts the API, Vite dashboard, and local OpenTripPlanner in one terminal. Press `Ctrl-C` once to stop all three.
 
 ## Daily Workflow
 
@@ -141,9 +150,22 @@ Use it from Airbnb or Leasebreak:
 3. On search/results pages, use the helper checklist and open one promising listing. PAMILA intentionally does not batch-capture visible search cards.
 4. On a specific listing page, click the compact "Save to PAMILA" button for quick capture.
 5. Use the "PAMILA" pill when you want the full helper panel, API status, troubleshooting, or the dashboard link.
-6. After saving, click "Open Inbox" or open the PAMILA dashboard and check Inbox for cleanup.
+6. After saving, the quick button changes to "Already in PAMILA". Use "Open Inbox" or "Open Details" to jump back to the dashboard.
 
-The helper appears on `airbnb.com`, `www.airbnb.com`, `leasebreak.com`, and `www.leasebreak.com`. The toolbar extension button still works as a fallback on specific listing pages. It captures only the page you are viewing. It does not crawl search results, background-fetch other listing pages, click filters for you, or inject buttons into every card.
+The helper appears on `airbnb.com`, `www.airbnb.com`, `leasebreak.com`, and `www.leasebreak.com`. The toolbar extension button still works as a fallback on specific listing pages. It captures only the page you are viewing. It does not crawl search results, background-fetch other listing pages, or click filters for you.
+
+Saved-state behavior:
+
+- PAMILA checks the local API to see whether an Airbnb listing is already saved.
+- After refresh, a saved Airbnb listing page should show "Already in PAMILA" instead of offering another duplicate save.
+- Airbnb search/results pages may show small green "In PAMILA" badges on visible card photos you have already saved. The helper panel also says how many visible cards matched saved listings.
+- If the API is offline, the extension can still show known saved listings from its local Chrome-storage cache, then confirm again once the API is back.
+
+Dead-link cleanup:
+
+- Use the dashboard header button "Clean dead links" when old Airbnb or Leasebreak listings are cluttering the app.
+- The cleanup is user-triggered and conservative: it removes only source links that clearly return `404` or `410`.
+- If a source blocks the check, rate-limits it, times out, or returns a server error, PAMILA leaves the listing alone and shows a warning instead of deleting it.
 
 Recommended Airbnb search checklist before opening a listing: NYC/Manhattan area, June 30 or July 1 through September 12, entire place, and around `$3,600` monthly max. For Leasebreak, pay close attention to earliest/latest move-in and move-out windows before saving.
 
@@ -168,22 +190,28 @@ ops/otp/README.md
 Short version:
 
 ```sh
-mkdir -p data/otp
-cp ops/otp/config/build-config.json data/otp/build-config.json
-cp ops/otp/config/router-config.json data/otp/router-config.json
+pnpm otp:download
+pnpm otp:clip-osm
+pnpm otp:build
+pnpm otp:run
 ```
 
-Add a NYC OSM `.pbf` and MTA GTFS ZIP files to `data/otp/`, then run:
+`pnpm otp:download` downloads a New York OpenStreetMap extract and MTA static GTFS feeds into `data/otp/`. `pnpm otp:build` uses Docker to build the local OTP graph. `pnpm otp:run` serves the graph on `http://127.0.0.1:8080`.
 
-```sh
-sh ops/otp/scripts/build-graph.sh
-sh ops/otp/scripts/run-server.sh
-```
+`pnpm otp:clip-osm` trims the New York State OSM extract down to the NYC area before building. Keep this step unless you have a very large Docker memory limit; the full state extract is much more likely to get killed during graph build. The original extract is kept with an `.archive` suffix so OTP does not try to read it.
+
+The default OTP commute date is `2026-05-06T09:00:00-04:00`, a representative Wednesday morning within the current MTA static feed window. When MTA publishes summer GTFS covering the actual internship dates, update `PAMILA_OTP_ARRIVAL_DATE_TIME` and rebuild OTP.
 
 Check OTP:
 
 ```sh
-sh ops/otp/scripts/check-health.sh
+pnpm otp:health
+```
+
+Once `pnpm otp:build` succeeds, the everyday command is:
+
+```sh
+pnpm dev:all
 ```
 
 If OTP is down or lacks a route, PAMILA keeps manual commute entry usable.
@@ -230,7 +258,7 @@ Run the Playwright smoke test:
 pnpm test:e2e
 ```
 
-The e2e test starts or reuses local API/web servers and stores smoke-test data in `data/pamila-e2e.sqlite`.
+The e2e test starts isolated API/web servers on `17410` and `15173`, and stores smoke-test data in `data/pamila-e2e.sqlite`. It should not reuse or write to your normal local API on `7410`.
 
 ## Local Data
 

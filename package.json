@@ -7,7 +7,13 @@
   "scripts": {
     "dev:web": "pnpm --filter @pamila/web dev",
     "dev:api": "pnpm --filter @pamila/api dev",
+    "dev:all": "sh ops/scripts/dev-all.sh",
     "dev:extension": "pnpm --filter @pamila/extension dev",
+    "otp:download": "sh ops/otp/scripts/download-nyc-data.sh",
+    "otp:clip-osm": "sh ops/otp/scripts/clip-nyc-osm.sh",
+    "otp:build": "sh ops/otp/scripts/build-graph.sh",
+    "otp:run": "sh ops/otp/scripts/run-server.sh",
+    "otp:health": "sh ops/otp/scripts/check-health.sh",
     "build:packages": "pnpm -r --sort --filter @pamila/core --filter @pamila/db --filter @pamila/ui run build",
     "build": "pnpm -r --sort run build",
     "typecheck": "pnpm run build:packages && pnpm -r --sort run typecheck",

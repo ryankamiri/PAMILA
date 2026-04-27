@@ -57,7 +57,11 @@ const MANHATTAN_NEIGHBORHOODS = [
   "financial district",
   "fidi",
   "upper east side",
+  "ues",
   "upper west side",
+  "uws",
+  "midtown west",
+  "hell's kitchen",
   "harlem"
 ];
 
@@ -97,14 +101,14 @@ export function buildCaptureCleanupSuggestions(capture: CaptureRecord): CaptureC
     hostQuestions.push("Can you confirm the advertised monthly rent and any required fees?");
   }
 
-  const stayType = parseStayType(lower);
+  const stayType = parseStayType(capture.visibleFields, lower);
   if (stayType !== null) {
     suggestedListingUpdate.stayType = stayType;
   } else {
     cleanupActions.push(cleanupAction("confirm_stay_type", "Confirm whether this is an entire apartment or private room.", "stayType"));
   }
 
-  const bedroom = parseBedroom(text);
+  const bedroom = parseBedroomFromFieldsAndText(capture.visibleFields, text);
   if (bedroom !== null) {
     suggestedListingUpdate.bedroomCount = bedroom.count;
     suggestedListingUpdate.bedroomLabel = bedroom.label;
@@ -142,7 +146,7 @@ export function buildCaptureCleanupSuggestions(capture: CaptureRecord): CaptureC
     hostQuestions.push("Would a June 30 or July 1 move-in be acceptable?");
   }
 
-  suggestedListingUpdate.availabilitySummary = buildAvailabilitySummary(text);
+  suggestedListingUpdate.availabilitySummary = buildAvailabilitySummary(capture.visibleFields, text);
   suggestedListingUpdate.nextAction = cleanupActions.length
     ? "Review imported capture suggestions and confirm missing fields."
     : "Review and decide whether to contact.";
@@ -231,14 +235,43 @@ function combinedCaptureText(capture: CaptureRecord) {
 }
 
 function parseMonthlyRent(fields: Record<string, string>, text: string): number | null {
+  const airbnbCurrentRent = findField(fields, ["airbnb_current_monthly_rent"]);
+  if (airbnbCurrentRent) {
+    const rent = parseRentFromText(airbnbCurrentRent);
+    if (rent !== null) {
+      return rent;
+    }
+  }
+
+  const discountedAirbnbRent = parseDiscountedAirbnbMonthlyRent(text);
+  if (discountedAirbnbRent !== null) {
+    return discountedAirbnbRent;
+  }
+
   const fieldCandidates = Object.entries(fields)
-    .filter(([key]) => /price|rent|monthly|cost/i.test(key))
+    .filter(([key]) => /price|rent|monthly|cost/i.test(key) && key !== "airbnb_original_monthly_rent")
     .map(([, value]) => value);
 
   for (const candidate of [...fieldCandidates, text]) {
     const rent = parseRentFromText(candidate);
     if (rent !== null) {
       return rent;
+    }
+  }
+
+  return null;
+}
+
+function parseDiscountedAirbnbMonthlyRent(input: string): number | null {
+  const normalized = input.replace(/\s+/g, " ").trim();
+  const matches = normalized.matchAll(
+    /\$([1-9][\d,]{2,})\s*(?:(?:monthly|month|\/\s*month|mo\b)\s+)?\$([1-9][\d,]{2,})\s*(?:monthly|month|\/\s*month|mo\b)/gi
+  );
+  for (const match of matches) {
+    const original = parseCurrencyAmount(match[1] ?? "");
+    const current = parseCurrencyAmount(match[2] ?? "");
+    if (original !== null && current !== null && original > current && current >= 1_000 && current <= 10_000) {
+      return current;
     }
   }
 
@@ -263,7 +296,34 @@ function parseRentFromText(input: string): number | null {
   return null;
 }
 
-function parseStayType(lowerText: string): StayType | null {
+function parseCurrencyAmount(value: string): number | null {
+  const amount = Number(value.replace(/[^\d]/g, ""));
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function parseStayType(fields: Record<string, string>, lowerText: string): StayType | null {
+  const candidate = findField(fields, ["stay_type_candidate"]);
+  if (candidate === "entire_apartment" || candidate === "private_room" || candidate === "shared_room") {
+    return candidate;
+  }
+
+  const leasebreakListingType = findField(fields, ["leasebreak_listing_type", "listing_type"]);
+  if (leasebreakListingType) {
+    const mapped = mapLeasebreakListingTypeToStayType(leasebreakListingType);
+    if (mapped !== null) {
+      return mapped;
+    }
+  }
+
+  if (/\bentire_apartment\b/.test(lowerText)) {
+    return "entire_apartment";
+  }
+  if (/\bprivate_room\b/.test(lowerText)) {
+    return "private_room";
+  }
+  if (/\bshared_room\b/.test(lowerText)) {
+    return "shared_room";
+  }
   if (/\b(shared room|shared bedroom)\b/.test(lowerText)) {
     return "shared_room";
   }
@@ -276,13 +336,58 @@ function parseStayType(lowerText: string): StayType | null {
   return null;
 }
 
+function mapLeasebreakListingTypeToStayType(listingType: string): StayType | null {
+  if (/\bshared\s+(?:room|bedroom)\b/i.test(listingType)) {
+    return "shared_room";
+  }
+
+  if (/\b(?:private\s+)?rooms?\b|\brooms?\s+for\s+rent\b/i.test(listingType)) {
+    return "private_room";
+  }
+
+  if (/\b(short\s+term\s+rental|sublet|lease\s+assignment|leasebreak|rental)\b/i.test(listingType)) {
+    return "entire_apartment";
+  }
+
+  return null;
+}
+
 function parseBedroom(text: string): { count: number; label: string } | null {
+  return parseBedroomFromFieldsAndText({}, text);
+}
+
+function parseBedroomFromFieldsAndText(
+  fields: Record<string, string>,
+  text: string
+): { count: number; label: string } | null {
+  const airbnbBedroomCount = findField(fields, ["airbnb_bedroom_count"]);
+  if (airbnbBedroomCount) {
+    const count = Number(airbnbBedroomCount);
+    if (Number.isFinite(count) && count >= 0) {
+      return { count, label: count === 0 ? "Studio" : `${count}BR` };
+    }
+  }
+
+  const leasebreakBedroomCount = findField(fields, ["leasebreak_bedroom_count"]);
+  if (leasebreakBedroomCount) {
+    const count = Number(leasebreakBedroomCount);
+    if (Number.isFinite(count) && count >= 0) {
+      return { count, label: count === 0 ? "Studio" : `${count}BR` };
+    }
+  }
+
+  const bedroomCandidate = findField(fields, ["bedroom_candidate", "airbnb_bedroom_summary"]);
+  const focusedText = bedroomCandidate ?? text;
   const lower = text.toLowerCase();
-  if (/\bstudio\b/.test(lower)) {
+  const focusedLower = focusedText.toLowerCase();
+  if (/\bstudio\b/.test(focusedLower) && !/\b\d+(?:\.\d+)?\s*bedrooms?\b/i.test(focusedText)) {
     return { count: 0, label: "Studio" };
   }
 
-  const match = /(\d+(?:\.\d+)?)\s*(?:bedroom|bedrooms|bed|br)\b/i.exec(text);
+  const match =
+    /(\d+(?:\.\d+)?)\s*bedrooms?\b/i.exec(focusedText) ??
+    /(\d+(?:\.\d+)?)\s*br\b/i.exec(focusedText) ??
+    /(\d+(?:\.\d+)?)\s*bed\b/i.exec(focusedText);
   if (!match?.[1]) {
     return null;
   }
@@ -424,6 +529,18 @@ function parseLocationSuggestion(
   fields: Record<string, string>,
   text: string
 ): UpsertLocationInput | null {
+  const airbnbLocation = parseAirbnbLocationSuggestion(fields);
+  if (airbnbLocation) {
+    return airbnbLocation;
+  }
+
+  if (source === "leasebreak") {
+    const leasebreakLocation = parseLeasebreakLocationSuggestion(fields, text);
+    if (leasebreakLocation) {
+      return leasebreakLocation;
+    }
+  }
+
   const locationField = findField(fields, ["address", "location", "neighborhood", "cross"]);
   const neighborhood = detectNeighborhood(`${locationField ?? ""}\n${text}`);
   const lowerLocation = locationField?.toLowerCase() ?? "";
@@ -468,6 +585,108 @@ function parseLocationSuggestion(
   return null;
 }
 
+function parseLeasebreakLocationSuggestion(fields: Record<string, string>, text: string): UpsertLocationInput | null {
+  const explicitAddress =
+    exactField(fields, "leasebreak_address") ??
+    exactField(fields, "address") ??
+    exactField(fields, "location_candidate") ??
+    extractStreetAddress(text);
+  const neighborhood = detectNeighborhood(
+    [
+      exactField(fields, "leasebreak_neighborhood"),
+      exactField(fields, "neighborhood_candidate"),
+      explicitAddress,
+      text
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+
+  if (explicitAddress) {
+    return {
+      address: normalizeNycAddress(explicitAddress),
+      confidence: "exact",
+      geographyCategory: geographyForLocation(explicitAddress, neighborhood),
+      isUserConfirmed: false,
+      label: explicitAddress,
+      neighborhood,
+      source: "exact_address"
+    };
+  }
+
+  const neighborhoodField = exactField(fields, "leasebreak_neighborhood") ?? exactField(fields, "neighborhood_candidate");
+  const label = neighborhood ?? neighborhoodField;
+  if (label) {
+    return {
+      confidence: "medium",
+      geographyCategory: geographyForLocation(label, neighborhood),
+      isUserConfirmed: false,
+      label,
+      neighborhood: neighborhood ?? label,
+      source: "neighborhood"
+    };
+  }
+
+  return null;
+}
+
+function parseAirbnbLocationSuggestion(fields: Record<string, string>): UpsertLocationInput | null {
+  const label = findField(fields, ["airbnb_location_label"]);
+  const lat = parseNumberField(fields.airbnb_approx_lat);
+  const lng = parseNumberField(fields.airbnb_approx_lng);
+  const inferredNeighborhood = lat !== null && lng !== null ? inferNycNeighborhoodFromCoordinates(lat, lng) : null;
+  const neighborhood = detectNeighborhood([label, inferredNeighborhood].filter(Boolean).join("\n")) ?? inferredNeighborhood;
+  const usableLabel = neighborhood ?? (label && !isGenericAirbnbLocationLabel(label) ? label : null);
+
+  if (!usableLabel && lat === null && lng === null) {
+    return null;
+  }
+
+  const finalLabel = usableLabel ?? "Airbnb approximate location";
+  return {
+    confidence: lat !== null && lng !== null ? "medium" : "low",
+    geographyCategory: geographyForLocation(finalLabel, neighborhood),
+    isUserConfirmed: false,
+    label: finalLabel,
+    lat,
+    lng,
+    neighborhood,
+    source: "airbnb_approx_pin"
+  };
+}
+
+function parseNumberField(value: string | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isGenericAirbnbLocationLabel(label: string) {
+  return /^(new york|new york, united states|nyc|united states)$/i.test(label.trim());
+}
+
+function exactField(fields: Record<string, string>, key: string): string | null {
+  const value = fields[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function extractStreetAddress(text: string): string | null {
+  const match = text.match(/\b\d{1,5}\s+[A-Z0-9][A-Za-z0-9 .'-]{1,80}?\s(?:st|street|ave|avenue|broadway|blvd|boulevard|rd|road)\b/i);
+  return match?.[0] ? normalizeAddressLabel(match[0]) : null;
+}
+
+function normalizeAddressLabel(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function normalizeNycAddress(value: string): string {
+  const normalized = normalizeAddressLabel(value);
+  return /new york|nyc|brooklyn|queens/i.test(normalized) ? normalized : `${normalized}, New York, NY`;
+}
+
 function findField(fields: Record<string, string>, keys: string[]): string | null {
   for (const [key, value] of Object.entries(fields)) {
     const lowerKey = key.toLowerCase();
@@ -480,8 +699,62 @@ function findField(fields: Record<string, string>, keys: string[]): string | nul
 
 function detectNeighborhood(text: string): string | null {
   const lower = text.toLowerCase();
+  const canonicalNeighborhoods: Array<[RegExp, string]> = [
+    [/\bupper west side\b|\buws\b/, "Upper West Side"],
+    [/\bupper east side\b|\bues\b/, "Upper East Side"],
+    [/\blong island city\b|\blic\b/, "Long Island City"],
+    [/\bastoria\b/, "Astoria"],
+    [/\bchelsea\b/, "Chelsea"],
+    [/\bflatiron\b/, "Flatiron"],
+    [/\bgramercy\b/, "Gramercy"],
+    [/\bunion square\b/, "Union Square"],
+    [/\bnomad\b/, "NoMad"],
+    [/\bmidtown west\b|\bhell['’]s kitchen\b/, "Midtown West / Hell's Kitchen"],
+    [/\bmidtown\b/, "Midtown"],
+    [/\bmurray hill\b/, "Murray Hill"],
+    [/\bkips bay\b/, "Kips Bay"],
+    [/\beast village\b/, "East Village"],
+    [/\bwest village\b/, "West Village"],
+    [/\bgreenwich village\b/, "Greenwich Village"],
+    [/\bsoho\b/, "SoHo"],
+    [/\btribeca\b/, "Tribeca"],
+    [/\blower east side\b/, "Lower East Side"],
+    [/\bfinancial district\b|\bfidi\b/, "Financial District"],
+    [/\bharlem\b/, "Harlem"],
+    [/\bwilliamsburg\b/, "Williamsburg"],
+    [/\bgreenpoint\b/, "Greenpoint"],
+    [/\bdumbo\b/, "DUMBO"],
+    [/\bbrooklyn heights\b/, "Brooklyn Heights"],
+    [/\bdowntown brooklyn\b/, "Downtown Brooklyn"],
+    [/\bfort greene\b/, "Fort Greene"],
+    [/\bclinton hill\b/, "Clinton Hill"],
+    [/\bpark slope\b/, "Park Slope"],
+    [/\bbushwick\b/, "Bushwick"],
+    [/\bbed-stuy\b|\bbedford-stuyvesant\b/, "Bed-Stuy"]
+  ];
+  for (const [pattern, label] of canonicalNeighborhoods) {
+    if (pattern.test(lower)) {
+      return label;
+    }
+  }
+
   const neighborhoods = [...MANHATTAN_NEIGHBORHOODS, ...LIC_ASTORIA_NEIGHBORHOODS, ...BROOKLYN_NEIGHBORHOODS];
   return neighborhoods.find((neighborhood) => lower.includes(neighborhood)) ?? null;
+}
+
+function inferNycNeighborhoodFromCoordinates(lat: number, lng: number): string | null {
+  const boxes: Array<{ label: string; minLat: number; maxLat: number; minLng: number; maxLng: number }> = [
+    { label: "Upper West Side", minLat: 40.765, maxLat: 40.805, minLng: -73.995, maxLng: -73.955 },
+    { label: "Upper East Side", minLat: 40.758, maxLat: 40.79, minLng: -73.97, maxLng: -73.935 },
+    { label: "Chelsea", minLat: 40.735, maxLat: 40.755, minLng: -74.01, maxLng: -73.99 },
+    { label: "Flatiron", minLat: 40.735, maxLat: 40.747, minLng: -73.997, maxLng: -73.985 },
+    { label: "Astoria", minLat: 40.755, maxLat: 40.79, minLng: -73.94, maxLng: -73.895 },
+    { label: "Long Island City", minLat: 40.735, maxLat: 40.765, minLng: -73.965, maxLng: -73.925 },
+    { label: "Williamsburg", minLat: 40.7, maxLat: 40.73, minLng: -73.97, maxLng: -73.93 },
+    { label: "Greenpoint", minLat: 40.725, maxLat: 40.745, minLng: -73.965, maxLng: -73.93 }
+  ];
+
+  return boxes.find((box) => lat >= box.minLat && lat <= box.maxLat && lng >= box.minLng && lng <= box.maxLng)?.label ?? null;
 }
 
 function geographyForLocation(locationText: string, neighborhood: string | null): GeographyCategory {
@@ -498,13 +771,94 @@ function geographyForLocation(locationText: string, neighborhood: string | null)
   return "unknown";
 }
 
-function buildAvailabilitySummary(text: string): string | null {
+function buildAvailabilitySummary(fields: Record<string, string>, text: string): string | null {
+  const leasebreakAvailability = buildLeasebreakAvailabilitySummary(fields);
+  if (leasebreakAvailability) {
+    return leasebreakAvailability;
+  }
+
+  const capturedAvailability = findField(fields, [
+    "airbnb_availability_summary",
+    "availability_summary_candidate",
+    "availability_candidate"
+  ]);
+  if (capturedAvailability) {
+    return normalizeAvailabilitySummary(capturedAvailability);
+  }
+
+  const dateRange = extractAvailabilityDateRange(text);
+  if (dateRange) {
+    return dateRange;
+  }
+
   const lines = text
     .split(/\n+/)
     .map((line) => line.trim())
     .filter(Boolean);
-  const availabilityLine = lines.find((line) => /available|availability|move|lease|month-to-month|immediate/i.test(line));
-  return availabilityLine?.slice(0, 240) ?? null;
+  const availabilityLine = lines.find((line) => {
+    if (isNoisyAvailabilityLine(line)) {
+      return false;
+    }
+    return /available|availability|move|lease|month-to-month|immediate/i.test(line);
+  });
+  return availabilityLine ? normalizeAvailabilitySummary(availabilityLine) : null;
+}
+
+function buildLeasebreakAvailabilitySummary(fields: Record<string, string>): string | null {
+  const earliestMoveIn = exactField(fields, "earliest_move_in_candidate");
+  const latestMoveIn = exactField(fields, "latest_move_in_candidate");
+  const earliestMoveOut = exactField(fields, "earliest_move_out_candidate");
+  const latestMoveOut = exactField(fields, "latest_move_out_candidate");
+  const moveInUrgency = exactField(fields, "move_in_urgency_candidate");
+  const parts: string[] = [];
+
+  if (earliestMoveIn) {
+    parts.push(`Earliest move-in: ${earliestMoveIn}`);
+  } else if (moveInUrgency && /\bimmediate\b/i.test(moveInUrgency)) {
+    parts.push("Immediate move-in listed");
+  }
+  if (latestMoveIn) {
+    parts.push(`Latest move-in: ${latestMoveIn}`);
+  }
+  if (earliestMoveOut) {
+    parts.push(`Earliest move-out: ${earliestMoveOut}`);
+  }
+  if (latestMoveOut) {
+    parts.push(`Latest move-out: ${latestMoveOut}`);
+  }
+
+  return parts.length > 0 ? normalizeAvailabilitySummary(parts.join("; ")) : null;
+}
+
+function extractAvailabilityDateRange(text: string): string | null {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const monthRange = normalized.match(
+    /\b((?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\.?\s+\d{1,2},\s+\d{4})\s*[-–]\s*((?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\.?\s+\d{1,2},\s+\d{4})\b/i
+  );
+  if (monthRange?.[1] && monthRange[2]) {
+    return `Available ${monthRange[1]} to ${monthRange[2]}`;
+  }
+
+  const checkInOut = normalized.match(
+    /\bcheck-?in\s+(\d{1,2}\/\d{1,2}\/\d{4})\s+check-?out\s+(\d{1,2}\/\d{1,2}\/\d{4})\b/i
+  );
+  return checkInOut?.[1] && checkInOut[2] ? `Available ${checkInOut[1]} to ${checkInOut[2]}` : null;
+}
+
+function normalizeAvailabilitySummary(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 240);
+}
+
+function isNoisyAvailabilityLine(line: string): boolean {
+  const lower = line.toLowerCase();
+  return (
+    line.length > 240 ||
+    lower.startsWith("skip to content") ||
+    lower.includes("leasebreak.com") ||
+    lower.includes("homes homes") ||
+    lower.includes("experiences experiences") ||
+    lower.includes("start your search")
+  );
 }
 
 function normalizeOpenAiAnalysisPayload(payload: Record<string, unknown>): OpenAiCaptureAnalysis {

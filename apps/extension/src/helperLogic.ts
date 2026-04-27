@@ -41,6 +41,19 @@ export function buildHelperViewModel(
   }
 
   if (page.status === "search_page") {
+    const guidanceBullets =
+      page.source === "leasebreak"
+        ? [
+            "Open one specific Leasebreak listing page before saving.",
+            "Check earliest/latest move-in and move-out windows on the listing page before importing.",
+            "PAMILA does not batch-capture search cards."
+          ]
+        : [
+            "Open one promising listing page before saving.",
+            "Airbnb filters: NYC/Manhattan, Jun 30 or Jul 1 through Sep 12, entire place, max around $3,600 monthly.",
+            "PAMILA does not batch-capture search cards."
+          ];
+
     return {
       apiStatusLabel: getApiStatusLabel(apiStatus),
       pageStatusLabel,
@@ -50,12 +63,7 @@ export function buildHelperViewModel(
       quickSaveLabel: null,
       quickSaveVisible: false,
       guidanceTitle: "Search page guidance",
-      guidanceBullets: [
-        "Open one promising listing page before saving.",
-        "Airbnb filters: NYC/Manhattan, Jun 30 or Jul 1 through Sep 12, entire place, max around $3,600 monthly.",
-        "Leasebreak date windows matter: earliest/latest move-in and move-out can change ranking.",
-        "PAMILA does not batch-capture search cards."
-      ]
+      guidanceBullets
     };
   }
 
@@ -121,7 +129,7 @@ function getQuickSaveLabel(apiStatus: ApiConnectionStatus | "checking", saveStat
   }
 
   if (saveStatus === "saved") {
-    return "Saved to PAMILA";
+    return "Already in PAMILA";
   }
 
   if (saveStatus === "error") {

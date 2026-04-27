@@ -231,6 +231,13 @@ a {
   background: rgb(15 23 42 / 44%);
 }
 
+.modal-backdrop {
+  position: fixed;
+  z-index: 920;
+  inset: 0;
+  background: rgb(15 23 42 / 54%);
+}
+
 .tour-dialog {
   position: fixed;
   z-index: 900;
@@ -280,8 +287,51 @@ a {
   line-height: 1.55;
 }
 
+.confirmation-dialog {
+  position: fixed;
+  z-index: 930;
+  top: 50%;
+  left: 50%;
+  width: min(480px, calc(100vw - 32px));
+  display: grid;
+  gap: 14px;
+  border: 1px solid #f0c2bd;
+  border-radius: 8px;
+  padding: 22px;
+  background: #ffffff;
+  box-shadow: 0 24px 72px rgb(15 23 42 / 28%);
+  transform: translate(-50%, -50%);
+}
+
+.confirmation-dialog h3 {
+  margin: 0;
+  color: #7a1f1f;
+  font-size: 1.35rem;
+}
+
+.confirmation-body {
+  display: grid;
+  gap: 10px;
+}
+
+.confirmation-body p {
+  margin: 0;
+  color: #354052;
+  line-height: 1.55;
+}
+
+.confirmation-error {
+  border: 1px solid #f0c2bd;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff1f0;
+  color: #8c2d2d;
+  font-weight: 800;
+}
+
 .tour-actions,
-.tour-step-actions {
+.tour-step-actions,
+.confirmation-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
@@ -294,6 +344,10 @@ a {
 
 .tour-step-actions {
   margin-left: auto;
+}
+
+.confirmation-actions {
+  justify-content: flex-end;
 }
 
 .toggle {
@@ -314,6 +368,46 @@ a {
   color: #1e5aa7;
   background: #eaf3ff;
   border-color: #cfe3ff;
+}
+
+.text-button-danger {
+  color: #8c2d2d;
+  background: #fff1f0;
+  border-color: #f0c2bd;
+}
+
+.danger-button {
+  min-height: 42px;
+  border: 1px solid #a83232;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 12px;
+  background: #b42318;
+  color: #ffffff;
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.danger-button span {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: rgb(255 255 255 / 18%);
+}
+
+.danger-button:hover {
+  background: #8c1d18;
+}
+
+.danger-button:disabled,
+.text-button:disabled {
+  cursor: wait;
+  opacity: 0.68;
 }
 
 .stats-grid {
@@ -1030,6 +1124,20 @@ a:focus-visible {
   font-weight: 800;
 }
 
+.route-warning-stack {
+  display: grid;
+  gap: 6px;
+}
+
+.route-warning-stack span {
+  color: #6d4800;
+}
+
+.route-warning a {
+  color: #225f52;
+  font-weight: 900;
+}
+
 .route-leg-list {
   display: grid;
   gap: 8px;
@@ -1168,7 +1276,8 @@ a:focus-visible {
   }
 
   .tour-dialog,
-  .tour-dialog-centered {
+  .tour-dialog-centered,
+  .confirmation-dialog {
     top: auto;
     right: 12px;
     bottom: 12px;

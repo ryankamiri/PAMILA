@@ -111,7 +111,7 @@ const DEFAULT_RAMP_COORDINATE: OtpCoordinate = {
   lon: -73.99154
 };
 
-const DEFAULT_ARRIVAL_DATE_TIME = "2026-07-01T09:00:00-04:00";
+const DEFAULT_ARRIVAL_DATE_TIME = "2026-05-06T09:00:00-04:00";
 const DEFAULT_TRANSIT_MODES = ["SUBWAY", "RAIL", "BUS"] as const;
 const WALK_MODES = new Set(["WALK"]);
 const BUS_MODES = new Set(["BUS", "COACH"]);
@@ -167,8 +167,8 @@ export function buildOtpGraphqlRequest(
           mode
           duration
           distance
-          start
-          end
+          start { scheduledTime }
+          end { scheduledTime }
           from { name }
           to { name }
           legGeometry { points }
@@ -704,14 +704,28 @@ function getDurationSeconds(record: Record<string, unknown>): number | null {
     }
   }
 
-  const start = getString(record, "start");
-  const end = getString(record, "end");
+  const start = getDateTimeString(record, "start");
+  const end = getDateTimeString(record, "end");
   if (start && end) {
     const startMs = Date.parse(start);
     const endMs = Date.parse(end);
     if (Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs) {
       return Math.round((endMs - startMs) / 1000);
     }
+  }
+
+  return null;
+}
+
+function getDateTimeString(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (isRecord(value)) {
+    return getString(value, "scheduledTime");
   }
 
   return null;

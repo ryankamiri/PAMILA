@@ -18,6 +18,7 @@ import {
   aiAnalyses,
   commuteEstimates,
   locations,
+  mediaThumbnails,
   scoreBreakdowns,
   settings,
   listings,
@@ -268,6 +269,24 @@ export class PamilaDatabase {
   deleteListing(id: string) {
     const result = this.db.delete(listings).where(eq(listings.id, id)).run();
     return result.changes > 0;
+  }
+
+  clearListingHistory() {
+    const deletedCount = this.listListings().length;
+
+    const clear = this.sqlite.transaction(() => {
+      this.db.delete(sourceCaptures).run();
+      this.db.delete(aiAnalyses).run();
+      this.db.delete(mediaThumbnails).run();
+      this.db.delete(scoreBreakdowns).run();
+      this.db.delete(commuteEstimates).run();
+      this.db.delete(locations).run();
+      this.db.delete(statusEvents).run();
+      this.db.delete(listings).run();
+    });
+
+    clear();
+    return { deletedCount };
   }
 
   importCapture(input: CaptureImportInput): { capture: CaptureRecord; listing: ListingWithScore } {

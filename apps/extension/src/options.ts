@@ -4,6 +4,7 @@ import { loadExtensionSettings, normalizeExtensionSettings, saveExtensionSetting
 const form = document.querySelector<HTMLFormElement>("#settings-form");
 const apiBaseUrlInput = document.querySelector<HTMLInputElement>("#api-base-url");
 const localTokenInput = document.querySelector<HTMLInputElement>("#local-token");
+const autoSaveLeasebreakListingsInput = document.querySelector<HTMLInputElement>("#auto-save-leasebreak-listings");
 const statusElement = document.querySelector<HTMLElement>("#status");
 const testConnectionButton = document.querySelector<HTMLButtonElement>("#test-connection");
 const reloadExtensionButton = document.querySelector<HTMLButtonElement>("#reload-extension");
@@ -35,6 +36,10 @@ async function hydrateOptions(): Promise<void> {
   if (localTokenInput) {
     localTokenInput.value = settings.localToken;
   }
+
+  if (autoSaveLeasebreakListingsInput) {
+    autoSaveLeasebreakListingsInput.checked = settings.autoSaveLeasebreakListings;
+  }
 }
 
 async function saveOptions(): Promise<void> {
@@ -54,7 +59,7 @@ async function testConnection(): Promise<void> {
 }
 
 function readSettingsFromForm(): ReturnType<typeof normalizeExtensionSettings> {
-  const input: { apiBaseUrl?: string; localToken?: string } = {};
+  const input: { apiBaseUrl?: string; localToken?: string; autoSaveLeasebreakListings?: boolean } = {};
 
   if (apiBaseUrlInput) {
     input.apiBaseUrl = apiBaseUrlInput.value;
@@ -62,6 +67,10 @@ function readSettingsFromForm(): ReturnType<typeof normalizeExtensionSettings> {
 
   if (localTokenInput) {
     input.localToken = localTokenInput.value;
+  }
+
+  if (autoSaveLeasebreakListingsInput) {
+    input.autoSaveLeasebreakListings = autoSaveLeasebreakListingsInput.checked;
   }
 
   return normalizeExtensionSettings(input);

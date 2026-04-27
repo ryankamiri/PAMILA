@@ -141,6 +141,30 @@ export interface ListingsJsonExport {
   captures: CapturePayload[];
 }
 
+export interface DeadLinkCheckItem {
+  id: string;
+  reason: string;
+  source: DashboardListing["source"];
+  sourceUrl: string;
+  status: number | null;
+  title: string;
+}
+
+export interface PruneDeadLinksResult {
+  checkedCount: number;
+  kept: DeadLinkCheckItem[];
+  listings: DashboardListing[];
+  removed: DeadLinkCheckItem[];
+  removedCount: number;
+  warnings: string[];
+}
+
+export interface ClearListingHistoryResult {
+  deletedCount: number;
+  listings: DashboardListing[];
+  settings: DashboardSettings;
+}
+
 export interface GeocodeListingResult {
   status: "ok" | "missing_query" | "geocoder_unavailable" | "no_result";
   location: ListingLocation | null;
@@ -178,4 +202,13 @@ export interface PrepareCommuteResult {
     | "manual_commute"
     | "review_route";
   externalDirectionsUrl: string | null;
+}
+
+export interface RoutePreparationNotice {
+  attemptedAt: string;
+  automatic: boolean;
+  externalDirectionsUrl: string | null;
+  nextStep: PrepareCommuteResult["nextStep"] | null;
+  status: PrepareCommuteResult["status"] | "api_offline";
+  warnings: string[];
 }

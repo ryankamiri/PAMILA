@@ -25,7 +25,7 @@ if [ ! -f "$DATA_DIR/build-config.json" ] || [ ! -f "$DATA_DIR/router-config.jso
 fi
 
 docker run --rm \
-  -e JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-"-Xmx6g"}" \
+  -e JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-"-Xmx4g"}" \
   -v "$(pwd)/$DATA_DIR:/var/opentripplanner" \
   "$IMAGE" \
   --build --save

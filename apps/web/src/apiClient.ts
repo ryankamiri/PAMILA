@@ -11,6 +11,7 @@ import {
 import type {
   CaptureReview,
   CalculateCommuteResult,
+  ClearListingHistoryResult,
   DashboardListing,
   DashboardSnapshot,
   DashboardSettings,
@@ -19,7 +20,8 @@ import type {
   ListingsJsonExport,
   ManualListingDraft,
   LocationSourceLabel,
-  PrepareCommuteResult
+  PrepareCommuteResult,
+  PruneDeadLinksResult
 } from "./dashboardTypes";
 
 export interface PamilaApiClientOptions {
@@ -261,6 +263,34 @@ export class PamilaApiClient {
     };
   }
 
+  async pruneDeadLinks(): Promise<PruneDeadLinksResult> {
+    const response = await this.request<Omit<PruneDeadLinksResult, "listings"> & { listings: ApiListingRecord[] }>(
+      "/api/listings/prune-dead-links",
+      {
+        method: "POST"
+      }
+    );
+
+    return {
+      ...response,
+      listings: response.listings.map(mapApiListing)
+    };
+  }
+
+  async clearListingHistory(): Promise<ClearListingHistoryResult> {
+    const response = await this.request<
+      Omit<ClearListingHistoryResult, "listings"> & { listings: ApiListingRecord[] }
+    >("/api/listings/clear-history", {
+      method: "POST"
+    });
+
+    return {
+      deletedCount: response.deletedCount,
+      listings: response.listings.map(mapApiListing),
+      settings: response.settings
+    };
+  }
+
   async exportListingsCsv(): Promise<ListingsCsvExport> {
     const body = await this.request<string>("/api/exports/listings.csv", {
       accept: "text/csv"
@@ -334,6 +364,10 @@ const defaultToken =
     : import.meta.env.VITE_PAMILA_LOCAL_TOKEN;
 
 export const defaultApiClient = new PamilaApiClient({
+  baseUrl:
+    import.meta.env.VITE_PAMILA_API_BASE_URL === undefined || import.meta.env.VITE_PAMILA_API_BASE_URL === ""
+      ? undefined
+      : import.meta.env.VITE_PAMILA_API_BASE_URL,
   token: defaultToken
 });
 

@@ -25,7 +25,7 @@ describe("otpAdapter", () => {
 
     expect(request.operationName).toBe("PamilaCommute");
     expect(request.query).toContain("planConnection");
-    expect(request.query).toContain('latestArrival: "2026-07-01T09:00:00-04:00"');
+    expect(request.query).toContain('latestArrival: "2026-05-06T09:00:00-04:00"');
     expect(request.query).toContain("latitude: 40.7465");
     expect(request.query).toContain("legGeometry");
     expect(request.query).toContain("points");
