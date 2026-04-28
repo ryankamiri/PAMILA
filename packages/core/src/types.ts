@@ -142,12 +142,25 @@ export interface CommuteRouteLeg {
   dashArray: string | null;
 }
 
+export interface CommuteRouteOption {
+  id: string;
+  label: string;
+  score: number;
+  summary: CommuteSummary;
+  legs: CommuteRouteLeg[];
+  reasons: string[];
+  selected: boolean;
+}
+
 export interface CommuteRouteDetail {
   calculatedAt: string;
   originLabel: string | null;
   destinationLabel: string;
   externalDirectionsUrl: string | null;
   legs: CommuteRouteLeg[];
+  selectionScore?: number;
+  selectionReasons?: string[];
+  alternatives?: CommuteRouteOption[];
 }
 
 export interface ScoreBreakdown {

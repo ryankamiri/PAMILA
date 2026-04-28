@@ -10,6 +10,8 @@ import {
   DEFAULT_SEARCH_SETTINGS,
   type CommuteRouteDetail,
   type CommuteRouteLeg,
+  type CommuteRouteOption,
+  type CommuteSummary,
   type ScoreBreakdown
 } from "@pamila/core";
 
@@ -1060,7 +1062,7 @@ function parseRouteDetail(input: string | null): CommuteRouteDetail | null {
       return null;
     }
 
-    return {
+    const routeDetail: CommuteRouteDetail = {
       calculatedAt: typeof parsed.calculatedAt === "string" ? parsed.calculatedAt : "",
       destinationLabel:
         typeof parsed.destinationLabel === "string" ? parsed.destinationLabel : "Ramp NYC",
@@ -1069,9 +1071,82 @@ function parseRouteDetail(input: string | null): CommuteRouteDetail | null {
       legs: parsed.legs.map(normalizeRouteLeg).filter((leg): leg is CommuteRouteLeg => leg !== null),
       originLabel: typeof parsed.originLabel === "string" ? parsed.originLabel : null
     };
+
+    if (typeof parsed.selectionScore === "number" && Number.isFinite(parsed.selectionScore)) {
+      routeDetail.selectionScore = parsed.selectionScore;
+    }
+
+    if (Array.isArray(parsed.selectionReasons)) {
+      routeDetail.selectionReasons = parsed.selectionReasons.filter(
+        (reason): reason is string => typeof reason === "string" && reason.length > 0
+      );
+    }
+
+    if (Array.isArray(parsed.alternatives)) {
+      const alternatives = parsed.alternatives
+        .map(normalizeRouteOption)
+        .filter((option): option is CommuteRouteOption => option !== null);
+      if (alternatives.length > 0) {
+        routeDetail.alternatives = alternatives;
+      }
+    }
+
+    return routeDetail;
   } catch {
     return null;
   }
+}
+
+function normalizeRouteOption(input: unknown): CommuteRouteOption | null {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+
+  const option = input as Partial<CommuteRouteOption>;
+  const summary = normalizeCommuteSummary(option.summary);
+  if (!summary || !Array.isArray(option.legs)) {
+    return null;
+  }
+
+  const legs = option.legs
+    .map(normalizeRouteLeg)
+    .filter((leg): leg is CommuteRouteLeg => leg !== null);
+
+  return {
+    id: typeof option.id === "string" && option.id.length > 0 ? option.id : randomUUID(),
+    label: typeof option.label === "string" && option.label.length > 0 ? option.label : "Route option",
+    legs,
+    reasons: Array.isArray(option.reasons)
+      ? option.reasons.filter((reason): reason is string => typeof reason === "string")
+      : [],
+    score: typeof option.score === "number" && Number.isFinite(option.score) ? option.score : 0,
+    selected: option.selected === true,
+    summary
+  };
+}
+
+function normalizeCommuteSummary(input: unknown): CommuteSummary | null {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+
+  const summary = input as Partial<CommuteSummary>;
+  const confidence =
+    summary.confidence === "exact" || summary.confidence === "estimated" || summary.confidence === "manual"
+      ? summary.confidence
+      : "estimated";
+
+  return {
+    confidence,
+    hasBusHeavyRoute: summary.hasBusHeavyRoute === true,
+    lineNames: Array.isArray(summary.lineNames)
+      ? summary.lineNames.filter((line): line is string => typeof line === "string")
+      : [],
+    routeSummary: typeof summary.routeSummary === "string" ? summary.routeSummary : null,
+    totalMinutes: typeof summary.totalMinutes === "number" ? summary.totalMinutes : null,
+    transferCount: typeof summary.transferCount === "number" ? summary.transferCount : null,
+    walkMinutes: typeof summary.walkMinutes === "number" ? summary.walkMinutes : null
+  };
 }
 
 function normalizeRouteLeg(input: unknown): CommuteRouteLeg | null {

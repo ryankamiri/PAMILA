@@ -93,6 +93,11 @@ describe("otpAdapter", () => {
       lineName: "N",
       style: "rail"
     });
+    expect(result.routeDetail.selectionScore).toBeGreaterThan(0);
+    expect(result.routeDetail.alternatives?.[0]).toMatchObject({
+      label: "Best PAMILA route",
+      selected: true
+    });
   });
 
   it("counts subway transfers and extracts route lines", () => {
@@ -154,6 +159,41 @@ describe("otpAdapter", () => {
     }
     expect(mapped.summary.hasBusHeavyRoute).toBe(true);
     expect(mapped.summary.lineNames).toEqual(["M23-SBS", "R"]);
+  });
+
+  it("prefers a higher-scoring non-bus route over a faster bus-heavy route", () => {
+    const mapped = mapOtpPlanResponse(
+      otpResponse([
+        itinerary([
+          leg("WALK", 480),
+          leg("BUS", 420, "M7"),
+          leg("WALK", 420)
+        ]),
+        itinerary([
+          leg("WALK", 360),
+          leg("SUBWAY", 1200, "1"),
+          leg("WALK", 240)
+        ])
+      ])
+    );
+
+    expect(mapped.status).toBe("ok");
+    if (mapped.status !== "ok") {
+      return;
+    }
+    expect(mapped.summary.lineNames).toEqual(["1"]);
+    expect(mapped.summary.hasBusHeavyRoute).toBe(false);
+    expect(mapped.summary.totalMinutes).toBe(30);
+    expect(mapped.routeOptions).toHaveLength(2);
+    expect(mapped.routeOptions[0]).toMatchObject({
+      label: "Best PAMILA route",
+      selected: true,
+      summary: {
+        lineNames: ["1"]
+      }
+    });
+    expect(mapped.routeOptions[1]?.summary.hasBusHeavyRoute).toBe(true);
+    expect(mapped.warnings[0]).toContain("non-bus-heavy route");
   });
 
   it("returns no_route when OTP has no itineraries", () => {

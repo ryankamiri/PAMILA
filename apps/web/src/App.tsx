@@ -5,7 +5,8 @@ import "leaflet/dist/leaflet.css";
 import {
   DEFAULT_LOCAL_PORTS,
   type CommuteRouteDetail,
-  type CommuteRouteLeg
+  type CommuteRouteLeg,
+  type CommuteRouteOption
 } from "@pamila/core";
 
 import { APP_NAME } from "./appConfig";
@@ -2187,6 +2188,8 @@ export function CommuteRoutePanel({
             ) : null}
           </p>
 
+          <RouteOptionsList routeDetail={routeDetail} />
+
           <div className="route-leg-list" aria-label="Route legs">
             {routeDetail.legs.length > 0 ? (
               routeDetail.legs.map((leg, index) => (
@@ -2214,6 +2217,50 @@ export function CommuteRoutePanel({
         </p>
       )}
     </section>
+  );
+}
+
+function RouteOptionsList({ routeDetail }: { routeDetail: CommuteRouteDetail }) {
+  const options = routeDetail.alternatives ?? [];
+
+  if (options.length <= 1 && routeDetail.selectionScore === undefined) {
+    return null;
+  }
+
+  return (
+    <div className="route-options" aria-label="OTP route options">
+      <div>
+        <p className="eyebrow">Route options</p>
+        <h4>Highest route score wins</h4>
+      </div>
+      {routeDetail.selectionReasons?.length ? (
+        <div className="route-option-reasons">
+          {routeDetail.selectionReasons.map((reason) => (
+            <span key={reason}>{reason}</span>
+          ))}
+        </div>
+      ) : null}
+      {options.length > 0 ? (
+        <div className="route-option-list">
+          {options.slice(0, 5).map((option) => (
+            <div
+              className={`route-option-row ${option.selected ? "route-option-selected" : ""}`}
+              key={option.id}
+            >
+              <span className="route-option-score">{option.score}</span>
+              <span>
+                <strong>{option.label}</strong>
+                <small>{routeOptionSummary(option)}</small>
+              </span>
+              <span className="route-option-badges">
+                {option.selected ? <em>Selected</em> : null}
+                {option.summary.hasBusHeavyRoute ? <em className="route-option-bus">Bus-heavy</em> : <em>No bus-heavy</em>}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -3123,6 +3170,15 @@ function routeLinesLabel(
           .filter((line): line is string => Boolean(line)) ?? [];
 
   return lines.length > 0 ? [...new Set(lines)].join(", ") : "Walk";
+}
+
+function routeOptionSummary(option: CommuteRouteOption) {
+  const total = option.summary.totalMinutes ? `${option.summary.totalMinutes} min` : "time ?";
+  const walk = option.summary.walkMinutes ? `${option.summary.walkMinutes} min walk` : "walk ?";
+  const transfers = `${option.summary.transferCount ?? "?"} transfers`;
+  const lines = option.summary.lineNames.length > 0 ? option.summary.lineNames.join(", ") : "Walk";
+
+  return `${total} · ${transfers} · ${walk} · ${lines}`;
 }
 
 function routeActionLabel(listing: DashboardListing) {

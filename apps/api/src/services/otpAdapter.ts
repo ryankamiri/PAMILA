@@ -3,6 +3,7 @@ import {
   RAMP_OFFICE,
   type CommuteRouteDetail,
   type CommuteRouteLeg,
+  type CommuteRouteOption,
   type CommuteRouteLegStyle,
   type CommuteSummary,
   type LocationConfidence,
@@ -62,6 +63,16 @@ export interface MappedOtpItinerary {
   end: string | null;
   durationSeconds: number | null;
   legs: MappedOtpLeg[];
+}
+
+export interface MappedOtpRouteOption {
+  id: string;
+  label: string;
+  itinerary: MappedOtpItinerary;
+  summary: CommuteSummary;
+  score: number;
+  reasons: string[];
+  selected: boolean;
 }
 
 export interface ManualCommuteInput {
@@ -134,7 +145,7 @@ export const DEFAULT_OTP_REQUEST_OPTIONS: OtpRequestOptions = {
   arrivalDateTime: DEFAULT_ARRIVAL_DATE_TIME,
   destination: DEFAULT_RAMP_COORDINATE,
   destinationLabel: RAMP_OFFICE.name,
-  numItineraries: 5,
+  numItineraries: 8,
   transitModes: [...DEFAULT_TRANSIT_MODES]
 };
 
@@ -261,7 +272,8 @@ export async function requestOtpCommute(
         calculatedAt: new Date().toISOString(),
         destinationLabel: options.destinationLabel ?? DEFAULT_OTP_REQUEST_OPTIONS.destinationLabel,
         externalDirectionsUrl,
-        originLabel: origin.label ?? origin.address ?? origin.crossStreets ?? origin.neighborhood ?? null
+        originLabel: origin.label ?? origin.address ?? origin.crossStreets ?? origin.neighborhood ?? null,
+        routeOptions: mapped.routeOptions
       }),
       status: "ok",
       summary: mapped.summary,
@@ -288,6 +300,7 @@ export function mapOtpPlanResponse(payload: unknown):
       status: "ok";
       summary: CommuteSummary;
       itinerary: MappedOtpItinerary;
+      routeOptions: MappedOtpRouteOption[];
       warnings: string[];
     }
   | {
@@ -313,14 +326,16 @@ export function mapOtpPlanResponse(payload: unknown):
     };
   }
 
-  const itinerary = chooseBestItinerary(itineraries);
-  const summary = summarizeItinerary(itinerary);
+  const routeOptions = rankItineraries(itineraries);
+  const selectedOption = routeOptions[0] as MappedOtpRouteOption;
+  const summary = selectedOption.summary;
 
   return {
-    itinerary,
+    itinerary: selectedOption.itinerary,
+    routeOptions,
     status: "ok",
     summary,
-    warnings: []
+    warnings: routeSelectionWarnings(routeOptions)
   };
 }
 
@@ -493,21 +508,193 @@ function mapLeg(leg: Record<string, unknown>): MappedOtpLeg {
 }
 
 function chooseBestItinerary(itineraries: MappedOtpItinerary[]): MappedOtpItinerary {
-  return [...itineraries].sort((left, right) => {
-    const leftDuration = totalSeconds(left) ?? Number.POSITIVE_INFINITY;
-    const rightDuration = totalSeconds(right) ?? Number.POSITIVE_INFINITY;
+  return (rankItineraries(itineraries)[0] as MappedOtpRouteOption).itinerary;
+}
+
+function rankItineraries(itineraries: MappedOtpItinerary[]): MappedOtpRouteOption[] {
+  const scored = itineraries.map((itinerary, index) => {
+    const summary = summarizeItinerary(itinerary);
+    const score = scoreItinerary(itinerary, summary);
+
+    return {
+      id: `route-${index + 1}`,
+      itinerary,
+      label: routeOptionLabel(summary, index),
+      reasons: routeOptionReasons(itinerary, summary, score),
+      score,
+      selected: false,
+      summary
+    };
+  });
+  const deduped = dedupeRouteOptions(scored);
+
+  deduped.sort((left, right) => {
+    if (left.score !== right.score) {
+      return right.score - left.score;
+    }
+
+    const leftDuration = totalSeconds(left.itinerary) ?? Number.POSITIVE_INFINITY;
+    const rightDuration = totalSeconds(right.itinerary) ?? Number.POSITIVE_INFINITY;
     if (leftDuration !== rightDuration) {
       return leftDuration - rightDuration;
     }
 
-    const leftTransfers = transferCount(left);
-    const rightTransfers = transferCount(right);
+    const leftTransfers = transferCount(left.itinerary);
+    const rightTransfers = transferCount(right.itinerary);
     if (leftTransfers !== rightTransfers) {
       return leftTransfers - rightTransfers;
     }
 
-    return (walkSeconds(left) ?? 0) - (walkSeconds(right) ?? 0);
-  })[0] as MappedOtpItinerary;
+    return (walkSeconds(left.itinerary) ?? 0) - (walkSeconds(right.itinerary) ?? 0);
+  });
+
+  return deduped.map((option, index) => ({
+    ...option,
+    label: index === 0 ? "Best PAMILA route" : `Alternative ${index + 1}`,
+    selected: index === 0
+  }));
+}
+
+function dedupeRouteOptions(routeOptions: MappedOtpRouteOption[]): MappedOtpRouteOption[] {
+  const seen = new Set<string>();
+  const deduped: MappedOtpRouteOption[] = [];
+
+  for (const option of routeOptions) {
+    const key = routeOptionDedupeKey(option);
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(option);
+  }
+
+  return deduped;
+}
+
+function routeOptionDedupeKey(option: MappedOtpRouteOption): string {
+  const legKey = option.itinerary.legs
+    .map((leg) => `${normalizeMode(leg.routeMode ?? leg.mode)}:${leg.routeShortName ?? leg.routeLongName ?? ""}`)
+    .join("|");
+
+  return [
+    option.summary.routeSummary ?? "route",
+    option.summary.totalMinutes ?? "?",
+    option.summary.walkMinutes ?? "?",
+    option.summary.transferCount ?? "?",
+    option.summary.hasBusHeavyRoute ? "bus-heavy" : "not-bus-heavy",
+    legKey
+  ].join("::");
+}
+
+function scoreItinerary(itinerary: MappedOtpItinerary, summary: CommuteSummary): number {
+  let score = 100;
+  const totalMinutes = summary.totalMinutes;
+  const walkMinutes = summary.walkMinutes ?? 0;
+  const transfers = summary.transferCount ?? transferCount(itinerary);
+  const busLegCount = itinerary.legs.filter(isBusLeg).length;
+  const transitLegs = itinerary.legs.filter(isTransitLeg);
+  const hasRailLikeLeg = transitLegs.some(isRailLikeLeg);
+
+  if (totalMinutes === null) {
+    score -= 25;
+  } else {
+    score -= Math.max(0, totalMinutes - 20) * 1.2;
+    score -= Math.max(0, totalMinutes - 35) * 2.5;
+  }
+
+  score -= transfers * 5;
+  score -= Math.max(0, walkMinutes - 10) * 2;
+  score -= Math.max(0, walkMinutes - 15) * 3;
+
+  if (summary.hasBusHeavyRoute) {
+    score -= 35;
+  }
+  if (busLegCount > 0) {
+    score -= 15 + busLegCount * 4;
+  }
+  if (transitLegs.length === 0 && (totalMinutes ?? 0) > 15) {
+    score -= 20;
+  }
+  if (hasRailLikeLeg) {
+    score += 8;
+  }
+  if (transfers === 0) {
+    score += 4;
+  }
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function routeOptionLabel(summary: CommuteSummary, index: number): string {
+  if (summary.lineNames.length > 0) {
+    return summary.lineNames.join(" -> ");
+  }
+
+  return index === 0 ? "Route option" : `Route option ${index + 1}`;
+}
+
+function routeOptionReasons(
+  itinerary: MappedOtpItinerary,
+  summary: CommuteSummary,
+  score: number
+): string[] {
+  const reasons: string[] = [];
+  const hasBus = itinerary.legs.some(isBusLeg);
+
+  if (!hasBus) {
+    reasons.push("No bus legs");
+  } else if (summary.hasBusHeavyRoute) {
+    reasons.push("Bus-heavy penalty");
+  } else {
+    reasons.push("Contains bus leg");
+  }
+
+  if (itinerary.legs.some(isRailLikeLeg)) {
+    reasons.push("Uses subway/rail");
+  }
+
+  if ((summary.transferCount ?? 0) === 0) {
+    reasons.push("No transfers");
+  }
+
+  if ((summary.walkMinutes ?? 0) > 15) {
+    reasons.push("Long walk penalty");
+  } else if ((summary.walkMinutes ?? 0) <= 10) {
+    reasons.push("Short walk");
+  }
+
+  reasons.push(`Route score ${score}/100`);
+  return reasons;
+}
+
+function routeSelectionWarnings(routeOptions: MappedOtpRouteOption[]): string[] {
+  const selected = routeOptions.find((option) => option.selected);
+  if (!selected) {
+    return [];
+  }
+
+  const fastest = [...routeOptions].sort((left, right) => {
+    const leftDuration = left.summary.totalMinutes ?? Number.POSITIVE_INFINITY;
+    const rightDuration = right.summary.totalMinutes ?? Number.POSITIVE_INFINITY;
+    return leftDuration - rightDuration;
+  })[0];
+
+  if (!fastest || fastest.id === selected.id) {
+    return [];
+  }
+
+  if (fastest.summary.hasBusHeavyRoute && !selected.summary.hasBusHeavyRoute) {
+    return [
+      `Selected a ${formatNullableMinutes(selected.summary.totalMinutes)} non-bus-heavy route over a ${formatNullableMinutes(
+        fastest.summary.totalMinutes
+      )} bus-heavy route.`
+    ];
+  }
+
+  return [
+    "Selected the highest-scoring route, which may be longer than the fastest OTP option."
+  ];
 }
 
 function summarizeItinerary(itinerary: MappedOtpItinerary): CommuteSummary {
@@ -531,14 +718,39 @@ function buildRouteDetail(
     destinationLabel: string;
     externalDirectionsUrl: string | null;
     originLabel: string | null;
+    routeOptions?: MappedOtpRouteOption[];
   }
 ): CommuteRouteDetail {
-  return {
+  const selectedOption = options.routeOptions?.find((option) => option.selected);
+  const routeDetail: CommuteRouteDetail = {
     calculatedAt: options.calculatedAt,
     destinationLabel: options.destinationLabel,
     externalDirectionsUrl: options.externalDirectionsUrl,
     legs: itinerary.legs.map(mapRouteDetailLeg),
     originLabel: options.originLabel
+  };
+
+  if (options.routeOptions) {
+    routeDetail.alternatives = options.routeOptions.map((option) => buildCommuteRouteOption(option));
+  }
+
+  if (selectedOption) {
+    routeDetail.selectionReasons = selectedOption.reasons;
+    routeDetail.selectionScore = selectedOption.score;
+  }
+
+  return routeDetail;
+}
+
+function buildCommuteRouteOption(option: MappedOtpRouteOption): CommuteRouteOption {
+  return {
+    id: option.id,
+    label: option.label,
+    legs: option.itinerary.legs.map(mapRouteDetailLeg),
+    reasons: option.reasons,
+    score: option.score,
+    selected: option.selected,
+    summary: option.summary
   };
 }
 
@@ -682,12 +894,21 @@ function isBusLeg(leg: MappedOtpLeg): boolean {
   return BUS_MODES.has(mode) || /^(B|BX|M|Q|S)\d/i.test(line);
 }
 
+function isRailLikeLeg(leg: MappedOtpLeg): boolean {
+  const mode = normalizeMode(leg.routeMode ?? leg.mode);
+  return mode === "RAIL" || mode === "SUBWAY" || mode === "TRAM";
+}
+
 function isWalkMode(mode: string): boolean {
   return WALK_MODES.has(normalizeMode(mode));
 }
 
 function normalizeMode(mode: string): string {
   return mode.trim().toUpperCase();
+}
+
+function formatNullableMinutes(minutes: number | null): string {
+  return minutes === null ? "unknown-time" : `${minutes}-minute`;
 }
 
 function getDurationSeconds(record: Record<string, unknown>): number | null {
